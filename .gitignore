@@ -1,0 +1,78 @@
+# Python
+
+**pycache**/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+
+.venv/
+venv/
+env/
+
+# Environment Variables / Secrets
+
+.env
+.env.*
+!.env.example
+
+# IDE
+
+.vscode/
+.idea/
+
+# macOS
+
+.DS_Store
+
+# Logs
+
+*.log
+
+# Testing / Coverage
+
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+
+.ipynb_checkpoints/
+
+# Build Artifacts
+
+build/
+dist/
+*.egg-info/
+
+# Local Databases
+
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary Files
+
+tmp/
+temp/
+*.tmp
+
+# Model Outputs / Experiments
+
+outputs/
+results/
+artifacts/
+
+# Agent Evaluation Results
+
+eval_results/
+reports/
+
+# Local Downloads
+
+downloads/
+
+# Cache
+
+.cache/
+.env
