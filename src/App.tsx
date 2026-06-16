@@ -218,6 +218,7 @@ export default function App() {
           <div>
             <p className="eyebrow">Prism</p>
             <h1>Health Concierge Copilot</h1>
+            <span className="topbar-subtitle">Care routing dashboard</span>
           </div>
         </div>
         <div className="topbar-actions">
@@ -232,14 +233,22 @@ export default function App() {
         </div>
       </header>
 
-      <section className="patient-strip">
+      <DashboardSummary
+        profile={profile}
+        careNeed={currentCareNeed}
+        recommendationCount={recommendations.length}
+        shortlistCount={shortlist.length}
+        onNavigate={setActiveTab}
+      />
+
+      <section className="patient-strip dashboard-context">
         <InfoPill icon={<MapPin size={16} />} label={profile.location} />
         <InfoPill icon={<Wallet size={16} />} label={`${profile.budgetType} budget`} />
         <InfoPill icon={<Route size={16} />} label={`${profile.travelTime} travel`} />
         <InfoPill icon={<Database size={16} />} label={analyticsSnapshot.source} />
       </section>
 
-      <nav className="tabbar" aria-label="Main navigation">
+      <nav className="tabbar dashboard-tabs" aria-label="Main navigation">
         <TabButton
           active={activeTab === "insights"}
           icon={<BarChart3 size={18} />}
@@ -310,6 +319,91 @@ export default function App() {
         />
       )}
     </main>
+  );
+}
+
+function DashboardSummary({
+  profile,
+  careNeed,
+  recommendationCount,
+  shortlistCount,
+  onNavigate,
+}: {
+  profile: UserProfile;
+  careNeed: CareNeed;
+  recommendationCount: number;
+  shortlistCount: number;
+  onNavigate: (tab: Tab) => void;
+}) {
+  const roleLabel = profile.role === "patient" ? "Patient view" : "Coordinator view";
+
+  return (
+    <section className="dashboard-hero" aria-label="Dashboard summary">
+      <div className="dashboard-hero-copy">
+        <p className="eyebrow">Care Workspace</p>
+        <h2>{profile.name}'s care dashboard</h2>
+        <p>{profile.currentProblems}</p>
+        <div className="dashboard-hero-actions">
+          <button type="button" className="primary-button compact-button" onClick={() => onNavigate("chat")}>
+            <MessageSquareText size={16} />
+            Open chat
+          </button>
+          <button type="button" className="icon-text-button" onClick={() => onNavigate("recommendations")}>
+            <ClipboardList size={16} />
+            Review shortlist
+          </button>
+        </div>
+      </div>
+      <div className="dashboard-vitals">
+        <DashboardMetric icon={<Stethoscope size={18} />} label="Care focus" value={careNeed} detail={roleLabel} tone="teal" />
+        <DashboardMetric
+          icon={<Building2 size={18} />}
+          label="Ranked options"
+          value={recommendationCount ? recommendationCount.toString() : "0"}
+          detail="Current chat session"
+          tone="blue"
+        />
+        <DashboardMetric
+          icon={<BookmarkCheck size={18} />}
+          label="Saved"
+          value={shortlistCount.toString()}
+          detail="Shortlist items"
+          tone="amber"
+        />
+        <DashboardMetric
+          icon={<ShieldCheck size={18} />}
+          label="Evidence"
+          value={`${analyticsSnapshot.evidenceConfidence}%`}
+          detail={analyticsSnapshot.generatedAt}
+          tone="rose"
+        />
+      </div>
+    </section>
+  );
+}
+
+function DashboardMetric({
+  icon,
+  label,
+  value,
+  detail,
+  tone,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: string;
+  detail: string;
+  tone: "teal" | "blue" | "amber" | "rose";
+}) {
+  return (
+    <div className={cn("dashboard-metric", `dashboard-metric-${tone}`)}>
+      <span className="dashboard-metric-icon">{icon}</span>
+      <div>
+        <span>{label}</span>
+        <strong>{value}</strong>
+        <small>{detail}</small>
+      </div>
+    </div>
   );
 }
 
@@ -450,10 +544,22 @@ function buildDatabricksNearestAnswer(recommendation: Recommendation, profile: U
 }
 
 function speakIfEnabled(text: string, speaking: boolean) {
-  if (speaking && "speechSynthesis" in window) {
+  const spokenText = text
+    .replace(/\*\*/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (speaking && spokenText && canSpeakReplies()) {
     window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+    window.speechSynthesis.speak(new SpeechSynthesisUtterance(spokenText));
+    return true;
   }
+
+  return false;
+}
+
+function canSpeakReplies() {
+  return "speechSynthesis" in window && "SpeechSynthesisUtterance" in window;
 }
 
 function Landing({ onEnter }: { onEnter: () => void }) {
@@ -840,6 +946,7 @@ function ChatTab({
   shortlist: string[];
 }) {
   const [draft, setDraft] = useState("");
+  const [speechError, setSpeechError] = useState("");
   const topRecommendation = recommendations[0];
   const quickPrompts = [
     "I need dialysis near Jaipur",
@@ -847,10 +954,30 @@ function ChatTab({
     "Which option is cheapest?",
     "Can you plan transport and hotel?",
   ];
+  const latestAssistantReply = [...messages].reverse().find((message) => message.role === "assistant");
 
   const submit = () => {
     onSend(draft);
     setDraft("");
+  };
+
+  const toggleSpeakReplies = () => {
+    const nextSpeaking = !speaking;
+
+    if (nextSpeaking && !canSpeakReplies()) {
+      setSpeechError("Speech replies are not supported in this browser");
+      setSpeaking(false);
+      return;
+    }
+
+    setSpeechError("");
+    setSpeaking(nextSpeaking);
+
+    if (nextSpeaking && latestAssistantReply) {
+      speakIfEnabled(latestAssistantReply.content, true);
+    } else if (!nextSpeaking && canSpeakReplies()) {
+      window.speechSynthesis.cancel();
+    }
   };
 
   return (
@@ -863,9 +990,14 @@ function ChatTab({
           </div>
           <div className="chat-heading-actions">
             <OpenAIVoiceChat profile={profile} recommendations={recommendations} />
-            <button type="button" className={cn("icon-text-button", speaking && "selected-soft")} onClick={() => setSpeaking(!speaking)}>
+            <button
+              type="button"
+              className={cn("icon-text-button", speaking && "selected-soft", speechError && "error-soft")}
+              onClick={toggleSpeakReplies}
+              title={speechError || "Speak the latest and future Prism replies"}
+            >
               <Volume2 size={16} />
-              Speak replies
+              {speechError ? "Speech unavailable" : speaking ? "Stop replies" : "Speak replies"}
             </button>
           </div>
         </div>
