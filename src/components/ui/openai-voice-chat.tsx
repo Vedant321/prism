@@ -3,11 +3,13 @@ import { useEffect, useRef, useState } from "react";
 import { cn } from "../../lib/utils";
 import type { Recommendation, UserProfile } from "../../types";
 
-type VoiceState = "idle" | "connecting" | "live" | "error";
+type VoiceState = "idle" | "connecting" | "live" | "listening" | "error";
 
 interface OpenAIVoiceChatProps {
   profile: UserProfile;
   recommendations: Recommendation[];
+  disabled?: boolean;
+  onTranscript?: (transcript: string) => void;
 }
 
 type RealtimeTokenResponse = {
@@ -16,17 +18,52 @@ type RealtimeTokenResponse = {
   error?: string;
 };
 
-export function OpenAIVoiceChat({ profile, recommendations }: OpenAIVoiceChatProps) {
+type BrowserSpeechRecognitionEvent = {
+  readonly resultIndex?: number;
+  readonly results: {
+    readonly length: number;
+    readonly [index: number]: {
+      readonly 0: {
+        readonly transcript: string;
+      };
+    };
+  };
+};
+
+type BrowserSpeechRecognition = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  maxAlternatives?: number;
+  start: () => void;
+  stop: () => void;
+  abort?: () => void;
+  onstart?: (() => void) | null;
+  onend: (() => void) | null;
+  onerror?: ((event: { error?: string; message?: string }) => void) | null;
+  onresult: ((event: BrowserSpeechRecognitionEvent) => void) | null;
+};
+
+export function OpenAIVoiceChat({ profile, recommendations, disabled = false, onTranscript }: OpenAIVoiceChatProps) {
   const [state, setState] = useState<VoiceState>("idle");
   const [status, setStatus] = useState("OpenAI voice");
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
 
   useEffect(() => stopSession, []);
 
   const stopSession = () => {
+    const recognition = recognitionRef.current;
+    if (recognition) {
+      recognition.onresult = null;
+      recognition.onerror = null;
+      recognition.onend = null;
+      recognition.stop();
+      recognitionRef.current = null;
+    }
     dataChannelRef.current?.close();
     dataChannelRef.current = null;
     peerRef.current?.close();
@@ -43,14 +80,15 @@ export function OpenAIVoiceChat({ profile, recommendations }: OpenAIVoiceChatPro
   };
 
   const startSession = async () => {
-    if (state === "connecting" || state === "live") {
+    if (disabled) return;
+
+    if (state === "connecting" || state === "live" || state === "listening") {
       stopSession();
       return;
     }
 
     if (!navigator.mediaDevices?.getUserMedia || typeof RTCPeerConnection === "undefined") {
-      setState("error");
-      setStatus("Voice is not supported in this browser");
+      startBrowserSpeechFallback("OpenAI voice is not supported in this browser");
       return;
     }
 
@@ -68,6 +106,10 @@ export function OpenAIVoiceChat({ profile, recommendations }: OpenAIVoiceChatPro
       });
       const tokenData = (await tokenResponse.json().catch(() => ({}))) as RealtimeTokenResponse;
       if (!tokenResponse.ok || !tokenData.ok || !tokenData.clientSecret) {
+        if (isConfigurationError(tokenData.error)) {
+          startBrowserSpeechFallback(tokenData.error ?? "OpenAI voice is not configured.");
+          return;
+        }
         throw new Error(tokenData.error ?? "OpenAI voice is not configured.");
       }
 
@@ -126,18 +168,92 @@ export function OpenAIVoiceChat({ profile, recommendations }: OpenAIVoiceChatPro
     }
   };
 
+  const startBrowserSpeechFallback = (reason: string) => {
+    const SpeechRecognition = window.SpeechRecognition ?? window.webkitSpeechRecognition;
+    if (!SpeechRecognition || !onTranscript) {
+      setState("error");
+      setStatus(reason);
+      return;
+    }
+
+    const recognition = new SpeechRecognition() as BrowserSpeechRecognition;
+    recognitionRef.current = recognition;
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = "en-US";
+    recognition.maxAlternatives = 1;
+
+    recognition.onstart = () => {
+      setState("listening");
+      setStatus("Listening with Chrome speech");
+    };
+    recognition.onresult = (event) => {
+      let transcript = "";
+      const startIndex = event.resultIndex ?? 0;
+      for (let index = startIndex; index < event.results.length; index += 1) {
+        transcript += event.results[index][0].transcript;
+      }
+      transcript = transcript.trim();
+      if (transcript) {
+        onTranscript(transcript);
+        setStatus(`Heard: ${transcript}`);
+      } else {
+        setStatus("I did not catch that");
+      }
+    };
+    recognition.onerror = (event) => {
+      setState("error");
+      setStatus(formatSpeechRecognitionError(event.error ?? event.message));
+    };
+    recognition.onend = () => {
+      recognitionRef.current = null;
+      setState((current) => (current === "error" ? current : "idle"));
+    };
+
+    try {
+      recognition.start();
+    } catch (error) {
+      setState("error");
+      setStatus(error instanceof Error ? error.message : reason);
+    }
+  };
+
   return (
     <button
       type="button"
-      className={cn("icon-text-button openai-voice-button", state === "live" && "selected-soft", state === "error" && "error-soft")}
+      className={cn(
+        "icon-text-button openai-voice-button",
+        (state === "live" || state === "listening") && "selected-soft",
+        state === "error" && "error-soft",
+      )}
       onClick={startSession}
-      aria-pressed={state === "live"}
+      disabled={disabled}
+      aria-pressed={state === "live" || state === "listening"}
       title={status}
     >
-      {state === "live" || state === "connecting" ? <MicOff size={16} /> : <Mic size={16} />}
-      {state === "live" ? "End voice" : state === "connecting" ? "Connecting" : state === "error" ? "Voice unavailable" : "Voice chat"}
+      {state === "live" || state === "connecting" || state === "listening" ? <MicOff size={16} /> : <Mic size={16} />}
+      {state === "live"
+        ? "End voice"
+        : state === "listening"
+          ? "Listening"
+          : state === "connecting"
+            ? "Connecting"
+            : state === "error"
+              ? "Voice unavailable"
+              : "Voice chat"}
     </button>
   );
+}
+
+function isConfigurationError(error?: string) {
+  return /OPENAI_API_KEY|not configured|not set|missing/i.test(error ?? "");
+}
+
+function formatSpeechRecognitionError(error?: string) {
+  if (error === "not-allowed" || error === "service-not-allowed") return "Microphone permission is blocked";
+  if (error === "no-speech") return "I did not hear anything";
+  if (error === "audio-capture") return "No microphone was found";
+  return error ? `Speech recognition failed: ${error}` : "Speech recognition failed";
 }
 
 function parseRealtimeEvent(data: unknown): any {

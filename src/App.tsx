@@ -85,9 +85,10 @@ export default function App() {
   const currentCareNeed = recommendations[0]?.careNeed ?? "Dialysis";
   const shortlistedRecommendations = recommendations.filter((item) => shortlist.includes(item.facility.id));
 
-  const handleSend = async (prompt: string) => {
+  const handleSend = async (prompt: string, options: { speak?: boolean } = {}) => {
     const trimmed = prompt.trim();
     if (!trimmed || codexBusy) return;
+    const shouldSpeakReply = speaking || Boolean(options.speak);
     const requestProfile = applyPromptProfileOverrides(profile, trimmed);
 
     let localResult = answerPrompt(trimmed, requestProfile, recommendations);
@@ -148,7 +149,7 @@ export default function App() {
         citations: localResult.citations,
       };
       setMessages((previous) => [...previous, assistantMessage]);
-      speakIfEnabled(localResult.text, speaking);
+      speakIfEnabled(localResult.text, shouldSpeakReply);
       return;
     }
 
@@ -168,7 +169,7 @@ export default function App() {
         trace: [...codexResult.trace, ...localResult.trace],
       };
       setMessages((previous) => [...previous, assistantMessage]);
-      speakIfEnabled(codexResult.text, speaking);
+      speakIfEnabled(codexResult.text, shouldSpeakReply);
     } catch (error) {
       const assistantMessage: ChatMessage = {
         id: uid("msg"),
@@ -178,7 +179,7 @@ export default function App() {
         trace: ["assistant_response: local fallback used", ...localResult.trace],
       };
       setMessages((previous) => [...previous, assistantMessage]);
-      speakIfEnabled(localResult.text, speaking);
+      speakIfEnabled(localResult.text, shouldSpeakReply);
     } finally {
       setCodexBusy(false);
     }
@@ -240,13 +241,6 @@ export default function App() {
         shortlistCount={shortlist.length}
         onNavigate={setActiveTab}
       />
-
-      <section className="patient-strip dashboard-context">
-        <InfoPill icon={<MapPin size={16} />} label={profile.location} />
-        <InfoPill icon={<Wallet size={16} />} label={`${profile.budgetType} budget`} />
-        <InfoPill icon={<Route size={16} />} label={`${profile.travelTime} travel`} />
-        <InfoPill icon={<Database size={16} />} label={analyticsSnapshot.source} />
-      </section>
 
       <nav className="tabbar dashboard-tabs" aria-label="Main navigation">
         <TabButton
@@ -336,24 +330,75 @@ function DashboardSummary({
   onNavigate: (tab: Tab) => void;
 }) {
   const roleLabel = profile.role === "patient" ? "Patient view" : "Coordinator view";
+  const hasRecommendations = recommendationCount > 0;
+  const hasShortlist = shortlistCount > 0;
 
   return (
-    <section className="dashboard-hero" aria-label="Dashboard summary">
-      <div className="dashboard-hero-copy">
-        <p className="eyebrow">Care Workspace</p>
-        <h2>{profile.name}'s care dashboard</h2>
-        <p>{profile.currentProblems}</p>
-        <div className="dashboard-hero-actions">
+    <section className="dashboard-command" aria-label="Dashboard summary">
+      <article className="case-record">
+        <div className="case-record-header">
+          <div>
+            <p className="eyebrow">Active case</p>
+            <h2>{profile.name}</h2>
+          </div>
+          <span className={cn("case-status", hasRecommendations && "case-status-ready")}>
+            {hasRecommendations ? "Ranked" : "Intake needed"}
+          </span>
+        </div>
+
+        <p className="case-problem">{profile.currentProblems}</p>
+
+        <div className="case-detail-grid">
+          <DashboardCaseDetail icon={<MapPin size={16} />} label="Location" value={profile.location} />
+          <DashboardCaseDetail icon={<Wallet size={16} />} label="Budget" value={profile.budgetType} />
+          <DashboardCaseDetail icon={<Route size={16} />} label="Travel" value={profile.travelTime} />
+          <DashboardCaseDetail icon={<Database size={16} />} label="Source" value={analyticsSnapshot.source} />
+        </div>
+      </article>
+
+      <article className="case-plan">
+        <div className="case-plan-header">
+          <div>
+            <p className="eyebrow">Next move</p>
+            <h3>{hasRecommendations ? "Review the ranked options" : "Start with care intake"}</h3>
+          </div>
+          <ShieldCheck size={20} />
+        </div>
+        <div className="case-step-list">
+          <div className="case-step case-step-active">
+            <span>01</span>
+            <div>
+              <strong>Care focus</strong>
+              <small>{careNeed}</small>
+            </div>
+          </div>
+          <div className={cn("case-step", hasRecommendations && "case-step-active")}>
+            <span>02</span>
+            <div>
+              <strong>Facility ranking</strong>
+              <small>{hasRecommendations ? `${recommendationCount} option(s) ready` : "Waiting for chat request"}</small>
+            </div>
+          </div>
+          <div className={cn("case-step", hasShortlist && "case-step-active")}>
+            <span>03</span>
+            <div>
+              <strong>Shortlist and trip</strong>
+              <small>{hasShortlist ? `${shortlistCount} saved` : "No saved facilities yet"}</small>
+            </div>
+          </div>
+        </div>
+        <div className="case-plan-actions">
           <button type="button" className="primary-button compact-button" onClick={() => onNavigate("chat")}>
             <MessageSquareText size={16} />
             Open chat
           </button>
           <button type="button" className="icon-text-button" onClick={() => onNavigate("recommendations")}>
             <ClipboardList size={16} />
-            Review shortlist
+            Recommendations
           </button>
         </div>
-      </div>
+      </article>
+
       <div className="dashboard-vitals">
         <DashboardMetric icon={<Stethoscope size={18} />} label="Care focus" value={careNeed} detail={roleLabel} tone="teal" />
         <DashboardMetric
@@ -379,6 +424,18 @@ function DashboardSummary({
         />
       </div>
     </section>
+  );
+}
+
+function DashboardCaseDetail({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
+  return (
+    <div className="case-detail">
+      <span>{icon}</span>
+      <div>
+        <small>{label}</small>
+        <strong>{value}</strong>
+      </div>
+    </div>
   );
 }
 
@@ -940,7 +997,7 @@ function ChatTab({
   speaking: boolean;
   setSpeaking: (value: boolean) => void;
   codexBusy: boolean;
-  onSend: (prompt: string) => void;
+  onSend: (prompt: string, options?: { speak?: boolean }) => void;
   onOpenRecommendations: () => void;
   onShortlist: (facilityId: string) => void;
   shortlist: string[];
@@ -989,7 +1046,16 @@ function ChatTab({
             <h2>{profile.role === "patient" ? "Step-by-step care guidance" : "Referral evidence workspace"}</h2>
           </div>
           <div className="chat-heading-actions">
-            <OpenAIVoiceChat profile={profile} recommendations={recommendations} />
+            <OpenAIVoiceChat
+              profile={profile}
+              recommendations={recommendations}
+              disabled={codexBusy}
+              onTranscript={(transcript) => {
+                setSpeechError("");
+                setSpeaking(true);
+                onSend(transcript, { speak: true });
+              }}
+            />
             <button
               type="button"
               className={cn("icon-text-button", speaking && "selected-soft", speechError && "error-soft")}
