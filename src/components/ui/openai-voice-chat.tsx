@@ -9,7 +9,9 @@ interface OpenAIVoiceChatProps {
   profile: UserProfile;
   recommendations: Recommendation[];
   disabled?: boolean;
+  onSpeechActivityChange?: (active: boolean) => void;
   onTranscript?: (transcript: string) => void;
+  onAssistantTranscript?: (transcript: string, options: { id: string; final?: boolean }) => void;
 }
 
 type RealtimeTokenResponse = {
@@ -44,16 +46,51 @@ type BrowserSpeechRecognition = {
   onresult: ((event: BrowserSpeechRecognitionEvent) => void) | null;
 };
 
-export function OpenAIVoiceChat({ profile, recommendations, disabled = false, onTranscript }: OpenAIVoiceChatProps) {
+export function OpenAIVoiceChat({
+  profile,
+  recommendations,
+  disabled = false,
+  onSpeechActivityChange,
+  onTranscript,
+  onAssistantTranscript,
+}: OpenAIVoiceChatProps) {
   const [state, setState] = useState<VoiceState>("idle");
   const [status, setStatus] = useState("OpenAI voice");
+  const [assistantSpeaking, setAssistantSpeaking] = useState(false);
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
   const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const submittedTranscriptKeysRef = useRef<Set<string>>(new Set());
+  const assistantTranscriptBuffersRef = useRef<Map<string, string>>(new Map());
+  const submittedAssistantTranscriptKeysRef = useRef<Set<string>>(new Set());
+  const submittedAssistantTranscriptTextKeysRef = useRef<Set<string>>(new Set());
 
   useEffect(() => stopSession, []);
+
+  const setAssistantSpeechActive = (active: boolean) => {
+    setAssistantSpeaking((previous) => (previous === active ? previous : active));
+    onSpeechActivityChange?.(active);
+  };
+
+  const submitAssistantTranscript = (key: string, transcript: string) => {
+    const trimmed = transcript.trim();
+    const textKey = `${realtimeAssistantTranscriptResponseId(key)}:${normalizeTranscript(trimmed)}`;
+    if (
+      !trimmed ||
+      !onAssistantTranscript ||
+      submittedAssistantTranscriptKeysRef.current.has(key) ||
+      submittedAssistantTranscriptTextKeysRef.current.has(textKey)
+    ) {
+      return;
+    }
+
+    submittedAssistantTranscriptKeysRef.current.add(key);
+    submittedAssistantTranscriptTextKeysRef.current.add(textKey);
+    assistantTranscriptBuffersRef.current.delete(key);
+    onAssistantTranscript(trimmed, { id: key, final: true });
+  };
 
   const stopSession = () => {
     const recognition = recognitionRef.current;
@@ -66,6 +103,11 @@ export function OpenAIVoiceChat({ profile, recommendations, disabled = false, on
     }
     dataChannelRef.current?.close();
     dataChannelRef.current = null;
+    submittedTranscriptKeysRef.current.clear();
+    assistantTranscriptBuffersRef.current.clear();
+    submittedAssistantTranscriptKeysRef.current.clear();
+    submittedAssistantTranscriptTextKeysRef.current.clear();
+    setAssistantSpeechActive(false);
     peerRef.current?.close();
     peerRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -80,12 +122,12 @@ export function OpenAIVoiceChat({ profile, recommendations, disabled = false, on
   };
 
   const startSession = async () => {
-    if (disabled) return;
-
     if (state === "connecting" || state === "live" || state === "listening") {
       stopSession();
       return;
     }
+
+    if (disabled) return;
 
     if (!navigator.mediaDevices?.getUserMedia || typeof RTCPeerConnection === "undefined") {
       startBrowserSpeechFallback("OpenAI voice is not supported in this browser");
@@ -138,6 +180,91 @@ export function OpenAIVoiceChat({ profile, recommendations, disabled = false, on
         if (payload?.type === "error") {
           setState("error");
           setStatus(payload.error?.message ?? "Voice session error");
+          setAssistantSpeechActive(false);
+          return;
+        }
+
+        if (payload?.type === "input_audio_buffer.speech_started") {
+          setState("listening");
+          setStatus("Listening");
+          setAssistantSpeechActive(false);
+          return;
+        }
+
+        if (payload?.type === "input_audio_buffer.speech_stopped") {
+          setState("live");
+          setStatus("Transcribing...");
+          return;
+        }
+
+        if (payload?.type === "conversation.item.input_audio_transcription.completed") {
+          const transcript = typeof payload.transcript === "string" ? payload.transcript.trim() : "";
+          if (!transcript || !onTranscript) {
+            setStatus("I did not catch that");
+            return;
+          }
+
+          const key = realtimeTranscriptKey(payload, transcript);
+          if (submittedTranscriptKeysRef.current.has(key)) return;
+
+          submittedTranscriptKeysRef.current.add(key);
+          onTranscript(transcript);
+          setState("live");
+          setStatus(`Heard: ${transcript}`);
+          return;
+        }
+
+        if (payload?.type === "response.output_audio.delta") {
+          setAssistantSpeechActive(true);
+          return;
+        }
+
+        if (payload?.type === "response.output_audio_transcript.delta") {
+          const delta = typeof payload.delta === "string" ? payload.delta : "";
+          if (delta && onAssistantTranscript) {
+            const key = realtimeAssistantTranscriptKey(payload);
+            const transcript = `${assistantTranscriptBuffersRef.current.get(key) ?? ""}${delta}`;
+            assistantTranscriptBuffersRef.current.set(key, transcript);
+            onAssistantTranscript(transcript, { id: key });
+            setAssistantSpeechActive(true);
+          }
+          return;
+        }
+
+        if (payload?.type === "response.output_audio_transcript.done") {
+          const key = realtimeAssistantTranscriptKey(payload);
+          const transcript =
+            typeof payload.transcript === "string" ? payload.transcript : assistantTranscriptBuffersRef.current.get(key) ?? "";
+          submitAssistantTranscript(key, transcript);
+          return;
+        }
+
+        if (
+          payload?.type === "response.done"
+        ) {
+          const responseId = String(payload.response?.id ?? payload.response_id ?? "response");
+          const hasBufferedTranscript = Array.from(assistantTranscriptBuffersRef.current.keys()).some((key) =>
+            key.startsWith(`${responseId}:`),
+          );
+          if (!hasBufferedTranscript) {
+            const transcript = extractRealtimeAssistantTranscript(payload);
+            if (transcript) submitAssistantTranscript(`${responseId}:response:0:0`, transcript);
+          }
+          setAssistantSpeechActive(false);
+          return;
+        }
+
+        if (
+          payload?.type === "response.output_audio.done" ||
+          payload?.type === "response.cancelled"
+        ) {
+          setAssistantSpeechActive(false);
+          return;
+        }
+
+        if (payload?.type === "conversation.item.input_audio_transcription.failed") {
+          setState("live");
+          setStatus(payload.error?.message ?? "Speech unavailable");
         }
       });
 
@@ -218,29 +345,41 @@ export function OpenAIVoiceChat({ profile, recommendations, disabled = false, on
     }
   };
 
+  const voiceActive = state === "connecting" || state === "live" || state === "listening";
+
   return (
     <button
       type="button"
       className={cn(
         "icon-text-button openai-voice-button",
         (state === "live" || state === "listening") && "selected-soft",
+        assistantSpeaking && "speaking-now",
         state === "error" && "error-soft",
       )}
       onClick={startSession}
-      disabled={disabled}
+      disabled={disabled && !voiceActive}
       aria-pressed={state === "live" || state === "listening"}
       title={status}
     >
-      {state === "live" || state === "connecting" || state === "listening" ? <MicOff size={16} /> : <Mic size={16} />}
-      {state === "live"
-        ? "End voice"
-        : state === "listening"
-          ? "Listening"
-          : state === "connecting"
-            ? "Connecting"
-            : state === "error"
-              ? "Voice unavailable"
-              : "Voice chat"}
+      <span className="speech-icon-wrap">
+        {voiceActive ? <MicOff size={16} /> : <Mic size={16} />}
+      </span>
+      <span>
+        {state === "live"
+          ? "End voice"
+          : state === "listening"
+            ? "Listening"
+            : state === "connecting"
+              ? "Connecting"
+              : state === "error"
+                ? "Voice unavailable"
+                : "Voice chat"}
+      </span>
+      <span className="speech-wave" aria-hidden="true">
+        {[0, 1, 2, 3].map((index) => (
+          <span key={index} style={{ animationDelay: `${index * 90}ms` }} />
+        ))}
+      </span>
     </button>
   );
 }
@@ -262,4 +401,40 @@ function parseRealtimeEvent(data: unknown): any {
   } catch {
     return null;
   }
+}
+
+function realtimeTranscriptKey(payload: any, transcript: string) {
+  return `${payload.item_id ?? "item"}:${payload.content_index ?? 0}:${transcript}`;
+}
+
+function realtimeAssistantTranscriptKey(payload: any) {
+  return [
+    payload.response_id ?? payload.response?.id ?? "response",
+    payload.item_id ?? payload.item?.id ?? "item",
+    payload.output_index ?? 0,
+    payload.content_index ?? 0,
+  ].join(":");
+}
+
+function realtimeAssistantTranscriptResponseId(key: string) {
+  return key.split(":")[0] || "response";
+}
+
+function normalizeTranscript(transcript: string) {
+  return transcript.replace(/\s+/g, " ").trim();
+}
+
+function extractRealtimeAssistantTranscript(payload: any) {
+  const output = Array.isArray(payload.response?.output) ? payload.response.output : [];
+  const transcripts: string[] = [];
+
+  for (const item of output) {
+    const content = Array.isArray(item?.content) ? item.content : [];
+    for (const part of content) {
+      if (typeof part?.transcript === "string") transcripts.push(part.transcript);
+      if (typeof part?.text === "string" && part?.type === "output_audio_transcript") transcripts.push(part.text);
+    }
+  }
+
+  return transcripts.join(" ").trim();
 }

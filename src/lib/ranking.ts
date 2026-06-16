@@ -199,8 +199,8 @@ export function answerPrompt(
     return {
       text:
         profile.role === "patient"
-          ? "Hi, I am Prism. Tell me your care need or symptoms, location, budget, travel priority, transport preference, pricing concerns, availability urgency, and booking needs. I will compare options with evidence, missing information, what to expect during the visit, and next steps."
-          : "Hi, I am Prism. Share the referral need, location, budget, travel constraints, transport options, pricing concerns, availability urgency, and booking requirements. I will compare facilities with source quality, uncertainty, evidence, and logistics.",
+          ? "Hi, I am Prism. We will do this as a journey. First, tell me the diagnosis or symptoms, and any reports or referral notes you already have. Then I can match hospitals by capability evidence. Booking, transport, and hotel can stay optional."
+          : "Hi, I am Prism. Share the diagnosis, referral reason, and available reports first. I will then match facilities by capability evidence and source quality. Booking, transport, and hotel planning can stay optional.",
       recommendations: existingRecommendations,
       trace: ["intake_check: greeting detected", "safety_check: waiting for care need"],
       citations: [analyticsSnapshot.source],
@@ -277,7 +277,7 @@ export function answerPrompt(
   if (wantsTrip && existingRecommendations.length > 0) {
     const plan = planJourney(existingRecommendations[0], profile);
     return {
-      text: `${profile.role === "patient" ? "Here is the next step-by-step journey plan." : "Journey plan prepared for referral coordination."} I would use ${plan.transportMode.toLowerCase()} to ${existingRecommendations[0].facility.name}, confirm by phone first, and hold ${plan.hotel.name} as the nearest ${plan.hotel.tier.toLowerCase()} hotel option. Estimated transport is ${formatCurrency(plan.estimatedTransportCost)} and ${plan.travelMinutes} minutes.`,
+      text: `Optional trip step: for ${existingRecommendations[0].facility.name}, ${plan.transportMode.toLowerCase()} is the best fit I see now: about ${plan.travelMinutes} minutes and roughly ${formatCurrency(plan.estimatedTransportCost)}. I would only move to hotel planning if you expect an overnight stay; the nearest ${plan.hotel.tier.toLowerCase()} option in the demo is ${plan.hotel.name}.`,
       recommendations: existingRecommendations,
       journeyPlan: plan,
       trace: [...trace, "travel_planning: selected transport and hotel from persona fit", "booking_assistant: generated call and document checklist"],
@@ -299,11 +299,14 @@ export function answerPrompt(
   const top = list[0];
   const patientTone =
     profile.role === "patient"
-      ? `The strongest option is ${top.facility.name}. It is ${top.facility.distanceKm.toFixed(1)} km away, appears able to handle ${top.careNeed.toLowerCase()}, and should take about ${top.estimatedTravelTime} minutes by ${profile.preferredTransportation.toLowerCase()}.`
-      : `${top.facility.name} ranks first for ${top.careNeed}: service taxonomy match, ${top.facility.distanceKm.toFixed(1)} km proximity, ${top.confidence}% post-penalty evidence confidence, and ${top.facility.availability.toLowerCase()}.`;
+      ? `Based on the diagnosis/care need so far, the strongest capability match is ${top.facility.name}. It is ${top.facility.distanceKm.toFixed(1)} km away and has service evidence for ${top.careNeed.toLowerCase()}.`
+      : `${top.facility.name} ranks first for ${top.careNeed}: capability taxonomy match, ${top.facility.distanceKm.toFixed(1)} km proximity, ${top.confidence}% post-penalty evidence confidence, and ${top.facility.availability.toLowerCase()}.`;
 
   const uncertainty = [
-    top.missingEvidence.length ? `Missing evidence: ${top.missingEvidence.join("; ")}.` : "No major missing evidence in the current demo snapshot.",
+    `Capability evidence: ${top.facility.services.join(", ")}.`,
+    top.missingEvidence.length
+      ? `Missing or uncertain: ${top.missingEvidence.join("; ")}.`
+      : "Direct equipment details are not separately listed, so I am using service capability evidence.",
     top.suspiciousEvidence.length ? `Potential conflict: ${top.suspiciousEvidence.join("; ")}.` : "No suspicious conflict was flagged for the top option.",
   ].join(" ");
 
@@ -312,7 +315,7 @@ export function answerPrompt(
     : "";
 
   return {
-    text: `${patientTone} ${uncertainty}${why} Before travel, call to confirm availability and pricing. I can now plan transport and a nearby hotel from your persona.`,
+    text: `${patientTone} ${uncertainty}${why} Optional next step: would you like help confirming booking for this facility, or should we stop here? Transport comes after booking intent, and hotel stays last only if an overnight stay is needed.`,
     recommendations: list,
     trace,
     citations: top.supportingEvidence.map((item) => item.source),

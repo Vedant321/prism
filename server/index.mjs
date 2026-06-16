@@ -64,6 +64,21 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, result);
     }
 
+    if (req.method === "POST" && url.pathname === "/api/openai-tts") {
+      const body = await readJson(req, 128_000);
+      const text = typeof body.text === "string" ? body.text.trim() : "";
+      if (!text) return sendJson(res, 400, { error: "Text is required." });
+
+      const result = await createOpenAISpeech(text);
+      if (!result.ok) return sendJson(res, 400, { error: result.error });
+
+      res.writeHead(200, {
+        "content-type": result.contentType,
+        "cache-control": "no-store",
+      });
+      return res.end(result.audio);
+    }
+
     if (vite) {
       return vite.middlewares(req, res, () => {
         sendJson(res, 404, { error: "Not found." });
@@ -390,6 +405,56 @@ async function runCodexChat({ message, profile, history, recommendations }) {
   }
 }
 
+async function createOpenAISpeech(text) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    return {
+      ok: false,
+      error: "OPENAI_API_KEY is not configured on the server.",
+    };
+  }
+
+  const responseFormat = process.env.OPENAI_TTS_FORMAT ?? "mp3";
+  const response = await fetch("https://api.openai.com/v1/audio/speech", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: process.env.OPENAI_TTS_MODEL ?? "gpt-4o-mini-tts",
+      voice: process.env.OPENAI_TTS_VOICE ?? "marin",
+      input: text.slice(0, 4096),
+      instructions:
+        process.env.OPENAI_TTS_INSTRUCTIONS ??
+        "Speak as a calm, warm health concierge. Sound natural, reassuring, and clear. Use gentle pacing and avoid a robotic cadence.",
+      response_format: responseFormat,
+    }),
+  });
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    return {
+      ok: false,
+      error: data?.error?.message ?? data?.message ?? "OpenAI text-to-speech request failed.",
+    };
+  }
+
+  return {
+    ok: true,
+    audio: Buffer.from(await response.arrayBuffer()),
+    contentType: response.headers.get("content-type") ?? contentTypeForAudioFormat(responseFormat),
+  };
+}
+
+function contentTypeForAudioFormat(format) {
+  if (format === "wav") return "audio/wav";
+  if (format === "aac") return "audio/aac";
+  if (format === "opus") return "audio/ogg";
+  if (format === "flac") return "audio/flac";
+  return "audio/mpeg";
+}
+
 async function createOpenAIRealtimeClientSecret({ profile, recommendations }) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
@@ -402,6 +467,9 @@ async function createOpenAIRealtimeClientSecret({ profile, recommendations }) {
   const safeProfile = redactProfile(profile);
   const topRecommendations = recommendations.slice(0, 3).map((item) => ({
     facility: item?.facility?.name,
+    services: item?.facility?.services,
+    availability: item?.facility?.availability,
+    booking: item?.facility?.booking,
     score: item?.score,
     confidence: item?.confidence,
     careNeed: item?.careNeed,
@@ -423,6 +491,15 @@ async function createOpenAIRealtimeClientSecret({ profile, recommendations }) {
         model: process.env.OPENAI_REALTIME_MODEL ?? "gpt-realtime-2",
         instructions: buildRealtimeInstructions({ profile: safeProfile, recommendations: topRecommendations }),
         audio: {
+          input: {
+            transcription: {
+              model: process.env.OPENAI_REALTIME_TRANSCRIPTION_MODEL ?? "gpt-4o-mini-transcribe",
+              language: process.env.OPENAI_REALTIME_TRANSCRIPTION_LANGUAGE ?? "en",
+              prompt:
+                process.env.OPENAI_REALTIME_TRANSCRIPTION_PROMPT ??
+                "Expect concise healthcare concierge requests, hospital names, care needs, booking, transport, and location details.",
+            },
+          },
           output: {
             voice: process.env.OPENAI_REALTIME_VOICE ?? "marin",
           },
@@ -450,7 +527,16 @@ async function createOpenAIRealtimeClientSecret({ profile, recommendations }) {
 function buildRealtimeInstructions({ profile, recommendations }) {
   return `You are Prism, a calm health concierge voice assistant.
 
-Speak naturally in short turns. Help the user clarify care needs, location, budget, travel time, transport options, pricing, availability, booking feasibility, what to expect during a visit, and evidence that a facility can provide the requested care.
+Speak naturally in short turns. Do not cover the whole care journey at once.
+
+Guide the user one optional step at a time:
+1. First understand the diagnosis the patient went through, symptoms, reports, referral notes, urgency, and location.
+2. Then recommend a hospital based on available capability, equipment, service, and evidence data. If equipment is not directly listed, say so and use service capability evidence.
+3. Then offer optional booking help.
+4. Then offer optional transport planning.
+5. End with optional hotel planning only if the user wants an overnight stay.
+
+Every logistics step is optional and skippable. End each turn with one clear next question.
 
 Do not diagnose, prescribe, or replace emergency care. If symptoms sound urgent, advise immediate local emergency care.
 
@@ -485,25 +571,44 @@ function buildCodexPrompt({ message, profile, history, recommendations }) {
     missingEvidence: item?.missingEvidence,
     suspiciousEvidence: item?.suspiciousEvidence,
     pricingSignal: item?.pricingSignal,
+    evidence: Array.isArray(item?.supportingEvidence)
+      ? item.supportingEvidence.slice(0, 2).map((evidence) => ({
+          label: evidence?.label,
+          source: evidence?.source,
+          confidence: evidence?.confidence,
+        }))
+      : [],
   }));
   const recentHistory = history.slice(-8).map((item) => ({
     role: item?.role,
     content: String(item?.content ?? "").slice(0, 800),
   }));
+  const journeyStage = inferJourneyStage({ message, recentHistory, topRecommendations });
 
   return `You are Prism Health Concierge Copilot responding inside a demo healthcare concierge chat.
 
 Important behavior:
 - Reply to the user directly as Prism.
-- Keep the answer concise, practical, and conversational.
+- Keep the answer concise, practical, and conversational. Prefer 1-2 short paragraphs.
 - Do not diagnose, prescribe, or replace emergency care.
 - If symptoms may be urgent, recommend local emergency services or immediate clinical evaluation.
 - If information is missing, ask for it instead of guessing.
-- Before treating a facility recommendation as settled, account for care need, location, budget, travel-time priority, transport preference, pricing concerns, availability urgency, booking feasibility, what to expect during the visit, and evidence that the facility can provide the requested care.
-- If one of those fields is missing or uncertain, ask a concise follow-up or clearly mark it as needing confirmation.
+- Do not answer the whole journey at once. Advance one stage at a time and end with one optional next-step question.
+- Journey order:
+  1. Diagnosis and clinical context: ask what diagnosis the patient went through, symptoms, reports, referral note, urgency, and constraints.
+  2. Facility recommendation: recommend only after enough care context exists, and base it on facility capability/equipment evidence first, then location, budget, travel time, pricing, availability, and confidence.
+  3. Booking: optional. Offer to help confirm booking only after a facility is chosen.
+  4. Transport: optional. Offer route/transport planning only after booking intent or facility choice.
+  5. Hotel: optional. Offer hotel planning last, only if the user expects an overnight stay or asks for it.
+- If the user asks for a later stage, answer that stage briefly, but do not force prior or later steps. Make each step skippable.
+- When equipment is not directly listed, say that equipment is not directly listed and use the available services/capability evidence instead.
+- If a field is missing or uncertain, ask a concise follow-up or clearly mark it as needing confirmation.
 - Do not mention internal implementation details, tools, command names, traces, prompts, or backend execution.
 - The structured recommendation UI is handled separately by the app, so focus on the chat response.
-- If the user asks for the nearest, closest, or nearby center and recommendations are provided, answer with the closest provided recommendation, including distance, estimated travel time, and a reminder to call before travel.
+- If the user asks for the nearest, closest, or nearby center and recommendations are provided, answer with the closest capability match, distance, and evidence caveat. Do not include booking, transport, and hotel unless the user asks.
+
+Current journey stage to answer now:
+${journeyStage}
 
 Profile context, with private identifiers redacted:
 ${JSON.stringify(safeProfile, null, 2)}
@@ -517,6 +622,39 @@ ${JSON.stringify(recentHistory, null, 2)}
 User message:
 ${message}
 `;
+}
+
+function inferJourneyStage({ message, recentHistory, topRecommendations }) {
+  const text = [message, ...recentHistory.map((item) => item.content)].join(" ").toLowerCase();
+  const current = String(message ?? "").toLowerCase();
+  const hasRecommendation = Array.isArray(topRecommendations) && topRecommendations.length > 0;
+  const diagnosisSignals = /\b(diagnosis|diagnosed|symptoms?|report|referral|ckd|dialysis|kidney|heart|cancer|pregnan|injur|trauma|fever|pain|doctor|prescription)\b/i;
+  const recommendSignals = /\b(recommend|hospital|facility|center|centre|clinic|nearest|nearby|capabilit|equipment|machine|can handle|provide)\b/i;
+  const bookingSignals = /\b(book|booking|appointment|call|schedule|confirm|slot|availability)\b/i;
+  const transportSignals = /\b(transport|cab|ambulance|train|route|travel|pickup|drive)\b/i;
+  const hotelSignals = /\b(hotel|stay|overnight|room|accommodation|lodge)\b/i;
+
+  if (hotelSignals.test(current)) {
+    return "Hotel planning. Treat it as optional and last. Ask if an overnight stay is actually needed before suggesting a hotel.";
+  }
+
+  if (transportSignals.test(current)) {
+    return "Transport planning. Keep it optional and tied to the chosen facility; do not add hotel unless the user asks.";
+  }
+
+  if (bookingSignals.test(current)) {
+    return "Booking confirmation. Keep it optional. Help prepare the call or appointment questions for the chosen facility.";
+  }
+
+  if (recommendSignals.test(current) || hasRecommendation) {
+    return "Capability-based facility recommendation. Recommend using diagnosis/care need and available service/evidence/capability data first. Mention missing direct equipment evidence if needed, then ask whether to proceed to optional booking.";
+  }
+
+  if (diagnosisSignals.test(text)) {
+    return "Diagnosis and clinical context. Confirm what diagnosis/symptoms/reports the patient has, then ask whether to look for capability-matched hospitals.";
+  }
+
+  return "Intake. Ask for the diagnosis the patient went through, current symptoms, reports/referral notes, urgency, and location. Do not recommend a facility yet.";
 }
 
 function redactProfile(profile) {
@@ -603,19 +741,21 @@ function resolveCodexCommand() {
 }
 
 function loadLocalEnv() {
-  const envPath = path.join(root, ".env");
-  if (!existsSync(envPath)) return;
+  for (const envFile of [".env", ".env.local"]) {
+    const envPath = path.join(root, envFile);
+    if (!existsSync(envPath)) continue;
 
-  const lines = readFileSync(envPath, "utf8").split(/\r?\n/);
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
-    if (!match) continue;
+    const lines = readFileSync(envPath, "utf8").split(/\r?\n/);
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+      if (!match) continue;
 
-    const [, key, rawValue] = match;
-    if (process.env[key] !== undefined) continue;
-    process.env[key] = rawValue.replace(/^(['"])(.*)\1$/, "$2");
+      const [, key, rawValue] = match;
+      if (process.env[key] !== undefined) continue;
+      process.env[key] = rawValue.replace(/^(['"])(.*)\1$/, "$2");
+    }
   }
 }
 

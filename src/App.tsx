@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -23,7 +23,6 @@ import {
   TrainFront,
   UserCog,
   UserRound,
-  Volume2,
   Wallet,
   X,
 } from "lucide-react";
@@ -69,14 +68,15 @@ export default function App() {
   const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
   const [journeyPlan, setJourneyPlan] = useState<JourneyPlan | null>(null);
   const [shortlist, setShortlist] = useState<string[]>([]);
-  const [speaking, setSpeaking] = useState(false);
+  const [speechPlaybackActive, setSpeechPlaybackActive] = useState(false);
   const [codexBusy, setCodexBusy] = useState(false);
+  const voiceAssistantMessageIdsRef = useRef<Map<string, string>>(new Map());
   const [messages, setMessages] = useState<ChatMessage[]>(() => [
     {
       id: uid("msg"),
       role: "assistant",
       content:
-        "I have your profile loaded. Tell me the care need or symptoms, location, budget, travel priority, transport preference, pricing concerns, availability urgency, and booking needs. I will rank facilities with evidence, missing data, travel time, what to expect during the visit, and next-step planning.",
+        "I have your profile loaded. Let us take this one step at a time. First, tell me the confirmed diagnosis or symptoms, plus any reports or referral notes you already have. After that I can match hospitals by capability evidence, then optionally help with booking, transport, and hotel planning.",
       citations: [analyticsSnapshot.source],
       trace: ["intake_check: profile loaded", "safety_check: waiting for care need"],
     },
@@ -84,11 +84,78 @@ export default function App() {
 
   const currentCareNeed = recommendations[0]?.careNeed ?? "Dialysis";
   const shortlistedRecommendations = recommendations.filter((item) => shortlist.includes(item.facility.id));
+  const setRealtimeSpeechActive = (active: boolean) => {
+    setSpeechPlaybackActive((previous) => (previous === active ? previous : active));
+  };
 
-  const handleSend = async (prompt: string, options: { speak?: boolean } = {}) => {
+  const handleVoiceUserTranscript = (transcript: string) => {
+    const trimmed = transcript.trim();
+    if (!trimmed) return;
+
+    const requestProfile = applyPromptProfileOverrides(profile, trimmed);
+    const localResult = answerPrompt(trimmed, requestProfile, recommendations);
+    setMessages((previous) => [
+      ...previous,
+      {
+        id: uid("msg"),
+        role: "user",
+        content: trimmed,
+        trace: ["voice_user_transcript: openai_realtime"],
+      },
+    ]);
+    setRecommendations(localResult.recommendations);
+    setJourneyPlan(localResult.journeyPlan ?? null);
+    if (/save|shortlist/i.test(trimmed) && localResult.recommendations[0]) {
+      setShortlist((previous) =>
+        previous.includes(localResult.recommendations[0].facility.id)
+          ? previous
+          : [...previous, localResult.recommendations[0].facility.id],
+      );
+    }
+  };
+
+  const handleVoiceAssistantTranscript = (
+    transcript: string,
+    options: { id: string; final?: boolean },
+  ) => {
+    const content = transcript.trim();
+    if (!content) return;
+
+    setMessages((previous) => {
+      const existingMessageId = voiceAssistantMessageIdsRef.current.get(options.id);
+      if (existingMessageId) {
+        return previous.map((message) =>
+          message.id === existingMessageId
+            ? {
+                ...message,
+                content,
+              }
+            : message,
+        );
+      }
+
+      const messageId = uid("msg");
+      voiceAssistantMessageIdsRef.current.set(options.id, messageId);
+      return [
+        ...previous,
+        {
+          id: messageId,
+          role: "assistant",
+          content,
+          citations: ["OpenAI Realtime voice"],
+          trace: ["voice_assistant_transcript: openai_realtime"],
+        },
+      ];
+    });
+
+    if (options.final) {
+      voiceAssistantMessageIdsRef.current.delete(options.id);
+    }
+  };
+
+  const handleSend = async (prompt: string) => {
     const trimmed = prompt.trim();
     if (!trimmed || codexBusy) return;
-    const shouldSpeakReply = speaking || Boolean(options.speak);
     const requestProfile = applyPromptProfileOverrides(profile, trimmed);
 
     let localResult = answerPrompt(trimmed, requestProfile, recommendations);
@@ -149,7 +216,6 @@ export default function App() {
         citations: localResult.citations,
       };
       setMessages((previous) => [...previous, assistantMessage]);
-      speakIfEnabled(localResult.text, shouldSpeakReply);
       return;
     }
 
@@ -169,7 +235,6 @@ export default function App() {
         trace: [...codexResult.trace, ...localResult.trace],
       };
       setMessages((previous) => [...previous, assistantMessage]);
-      speakIfEnabled(codexResult.text, shouldSpeakReply);
     } catch (error) {
       const assistantMessage: ChatMessage = {
         id: uid("msg"),
@@ -179,7 +244,6 @@ export default function App() {
         trace: ["assistant_response: local fallback used", ...localResult.trace],
       };
       setMessages((previous) => [...previous, assistantMessage]);
-      speakIfEnabled(localResult.text, shouldSpeakReply);
     } finally {
       setCodexBusy(false);
     }
@@ -277,10 +341,12 @@ export default function App() {
             profile={profile}
             messages={messages}
             recommendations={recommendations}
-            speaking={speaking}
-            setSpeaking={setSpeaking}
+            speechPlaybackActive={speechPlaybackActive}
+            setRealtimeSpeechActive={setRealtimeSpeechActive}
             codexBusy={codexBusy}
             onSend={handleSend}
+            onVoiceUserTranscript={handleVoiceUserTranscript}
+            onVoiceAssistantTranscript={handleVoiceAssistantTranscript}
             onOpenRecommendations={() => setActiveTab("recommendations")}
             onShortlist={toggleShortlist}
             shortlist={shortlist}
@@ -504,10 +570,21 @@ function isNearestPrompt(prompt: string) {
 function applyPromptProfileOverrides(profile: UserProfile, prompt: string): UserProfile {
   return {
     ...profile,
+    location: detectLocationOverride(prompt) ?? profile.location,
     budgetType: detectBudgetOverride(prompt) ?? profile.budgetType,
     travelTime: detectTravelOverride(prompt) ?? profile.travelTime,
     preferredTransportation: detectTransportOverride(prompt) ?? profile.preferredTransportation,
   };
+}
+
+function detectLocationOverride(prompt: string) {
+  const match = prompt.match(/\b(?:near|in|around|from)\s+([A-Z][A-Za-z\s]+?)(?:[,.;!?]|$|\s+(?:with|for|and|economy|balanced|luxury|elite|budget|cab|ambulance|train|quickest|fastest|nearby|hospital|clinic|center|centre))/);
+  if (!match) return null;
+
+  const location = match[1].trim().replace(/\s+/g, " ");
+  if (!location || location.length < 2) return null;
+
+  return location;
 }
 
 function detectBudgetOverride(prompt: string): BudgetType | null {
@@ -573,50 +650,20 @@ async function callDatabricksNearest({
 function buildDatabricksNearestAnswer(recommendation: Recommendation, profile: UserProfile, careNeed: CareNeed) {
   const facility = recommendation.facility;
   const selectedTravelMinutes = facility.travelTimes[profile.preferredTransportation] ?? recommendation.estimatedTravelTime;
-  const transportOptions = Object.entries(facility.travelTimes)
-    .filter((entry): entry is [TransportPreference, number] => typeof entry[1] === "number" && entry[1] > 0)
-    .map(([mode, minutes]) => `${mode.toLowerCase()} ${minutes} min`)
-    .join(", ");
   const evidence = recommendation.supportingEvidence[0];
-  const pricing =
-    facility.averageVisitCost > 0
-      ? `${formatCurrency(facility.averageVisitCost)} typical first-visit estimate`
-      : "pricing is not listed in Databricks, so call before travel";
   const missingEvidence = recommendation.missingEvidence.length
     ? recommendation.missingEvidence.join("; ")
-    : "same-day availability, final price, and booking rules still need phone confirmation";
+    : "direct equipment list, same-day availability, final price, and booking rules still need phone confirmation";
 
   return [
-    `I fetched the nearest matching centers from Databricks. **${facility.name}** is the best current match for **${careNeed.toLowerCase()}** near **${profile.location}**: ${facility.distanceKm.toFixed(
+    `Based on the diagnosis/care need I have so far, **${facility.name}** is the nearest capability match for **${careNeed.toLowerCase()}** near **${profile.location}**: ${facility.distanceKm.toFixed(
       1,
     )} km away, about ${selectedTravelMinutes} minutes by ${profile.preferredTransportation.toLowerCase()}.`,
-    `**Care context checked:** care need ${careNeed}; location ${profile.location}; budget ${profile.budgetType}; travel priority ${profile.travelTime.toLowerCase()}; preferred transport ${profile.preferredTransportation.toLowerCase()}.`,
-    `**Transport options:** ${transportOptions || "transport times are not available in Databricks yet"}.`,
-    `**Pricing:** ${pricing}. **Availability:** ${facility.availability}. **Booking feasibility:** ${facility.booking}; call ${facility.phone} before travel.`,
-    `**What to expect:** carry ID, insurance or government health card, recent reports, prescriptions, and any referral note. For ${careNeed.toLowerCase()}, ask the desk to confirm service availability, expected wait time, payment estimate, and required pre-visit documents.`,
-    `**Evidence:** ${evidence?.label ?? "Databricks facility row"} from ${evidence?.source ?? "Databricks"}, freshness ${
+    `Capability evidence: ${facility.services.join(", ")}. Supporting source: ${evidence?.label ?? "Databricks facility row"} from ${evidence?.source ?? "Databricks"}, freshness ${
       evidence?.freshness ?? "not listed"
     }, confidence ${recommendation.confidence}%. Missing or uncertain: ${missingEvidence}.`,
+    "Optional next step: would you like help confirming booking for this facility, or should we stop here? Transport comes after booking intent, and hotel stays last only if an overnight stay is needed.",
   ].join("\n\n");
-}
-
-function speakIfEnabled(text: string, speaking: boolean) {
-  const spokenText = text
-    .replace(/\*\*/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  if (speaking && spokenText && canSpeakReplies()) {
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(new SpeechSynthesisUtterance(spokenText));
-    return true;
-  }
-
-  return false;
-}
-
-function canSpeakReplies() {
-  return "speechSynthesis" in window && "SpeechSynthesisUtterance" in window;
 }
 
 function Landing({ onEnter }: { onEnter: () => void }) {
@@ -663,7 +710,7 @@ function ProfileDialog({
   onClose,
 }: {
   profile: UserProfile;
-  setProfile: (profile: UserProfile) => void;
+  setProfile: React.Dispatch<React.SetStateAction<UserProfile>>;
   onClose: () => void;
 }) {
   return (
@@ -692,13 +739,13 @@ function ProfileForm({
   compact,
 }: {
   profile: UserProfile;
-  setProfile: (profile: UserProfile) => void;
+  setProfile: React.Dispatch<React.SetStateAction<UserProfile>>;
   onSubmit: () => void;
   submitLabel: string;
   compact?: boolean;
 }) {
   const setField = <K extends keyof UserProfile>(field: K, value: UserProfile[K]) => {
-    setProfile({ ...profile, [field]: value });
+    setProfile((current) => ({ ...current, [field]: value }));
   };
 
   return (
@@ -983,10 +1030,12 @@ function ChatTab({
   profile,
   messages,
   recommendations,
-  speaking,
-  setSpeaking,
+  speechPlaybackActive,
+  setRealtimeSpeechActive,
   codexBusy,
   onSend,
+  onVoiceUserTranscript,
+  onVoiceAssistantTranscript,
   onOpenRecommendations,
   onShortlist,
   shortlist,
@@ -994,47 +1043,29 @@ function ChatTab({
   profile: UserProfile;
   messages: ChatMessage[];
   recommendations: Recommendation[];
-  speaking: boolean;
-  setSpeaking: (value: boolean) => void;
+  speechPlaybackActive: boolean;
+  setRealtimeSpeechActive: (active: boolean) => void;
   codexBusy: boolean;
-  onSend: (prompt: string, options?: { speak?: boolean }) => void;
+  onSend: (prompt: string) => void;
+  onVoiceUserTranscript: (transcript: string) => void;
+  onVoiceAssistantTranscript: (transcript: string, options: { id: string; final?: boolean }) => void;
   onOpenRecommendations: () => void;
   onShortlist: (facilityId: string) => void;
   shortlist: string[];
 }) {
   const [draft, setDraft] = useState("");
-  const [speechError, setSpeechError] = useState("");
   const topRecommendation = recommendations[0];
   const quickPrompts = [
-    "I need dialysis near Jaipur",
-    "Why is this facility ranked higher?",
-    "Which option is cheapest?",
-    "Can you plan transport and hotel?",
+    "My diagnosis is CKD and I may need dialysis",
+    "Recommend a hospital by capability",
+    "Help me with optional booking",
+    "Plan optional transport",
   ];
   const latestAssistantReply = [...messages].reverse().find((message) => message.role === "assistant");
 
   const submit = () => {
     onSend(draft);
     setDraft("");
-  };
-
-  const toggleSpeakReplies = () => {
-    const nextSpeaking = !speaking;
-
-    if (nextSpeaking && !canSpeakReplies()) {
-      setSpeechError("Speech replies are not supported in this browser");
-      setSpeaking(false);
-      return;
-    }
-
-    setSpeechError("");
-    setSpeaking(nextSpeaking);
-
-    if (nextSpeaking && latestAssistantReply) {
-      speakIfEnabled(latestAssistantReply.content, true);
-    } else if (!nextSpeaking && canSpeakReplies()) {
-      window.speechSynthesis.cancel();
-    }
   };
 
   return (
@@ -1050,27 +1081,20 @@ function ChatTab({
               profile={profile}
               recommendations={recommendations}
               disabled={codexBusy}
-              onTranscript={(transcript) => {
-                setSpeechError("");
-                setSpeaking(true);
-                onSend(transcript, { speak: true });
-              }}
+              onSpeechActivityChange={setRealtimeSpeechActive}
+              onTranscript={onVoiceUserTranscript}
+              onAssistantTranscript={onVoiceAssistantTranscript}
             />
-            <button
-              type="button"
-              className={cn("icon-text-button", speaking && "selected-soft", speechError && "error-soft")}
-              onClick={toggleSpeakReplies}
-              title={speechError || "Speak the latest and future Prism replies"}
-            >
-              <Volume2 size={16} />
-              {speechError ? "Speech unavailable" : speaking ? "Stop replies" : "Speak replies"}
-            </button>
           </div>
         </div>
 
         <div className="message-list" aria-live="polite">
           {messages.map((message) => (
-            <MessageBubble key={message.id} message={message} />
+            <MessageBubble
+              key={message.id}
+              message={message}
+              isSpeaking={speechPlaybackActive && latestAssistantReply?.id === message.id}
+            />
           ))}
           {codexBusy && (
             <article className="message">
@@ -1333,9 +1357,9 @@ function EvidenceSection({ recommendation }: { recommendation: Recommendation })
   );
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
+function MessageBubble({ message, isSpeaking = false }: { message: ChatMessage; isSpeaking?: boolean }) {
   return (
-    <article className={cn("message", message.role)}>
+    <article className={cn("message", message.role, isSpeaking && "message-speaking")}>
       <div className="message-avatar">{message.role === "assistant" ? <Bot size={18} /> : <UserRound size={18} />}</div>
       <div className="message-content">
         {renderMessageContent(message.content)}
