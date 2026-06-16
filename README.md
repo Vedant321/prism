@@ -1,6 +1,6 @@
 # Prism Health Concierge Copilot
 
-Prism is a runnable React demo for an AI-powered health concierge. It supports profile setup, patient vs doctor/coordinator modes, Databricks-style insights, chat-driven facility ranking, evidence and uncertainty display, shortlist saving, and trip planning.
+Prism is a runnable React demo for an AI-powered health concierge built for Databricks AI for Good. It supports profile setup, patient vs doctor/coordinator modes, Databricks-style insights, chat-driven facility ranking, evidence and uncertainty display, shortlist saving, and trip planning.
 
 ## Run Locally
 

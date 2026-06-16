@@ -1,5 +1,6 @@
 node_modules/
 dist/
+build/
 .npm-cache/
 .env
 .env.*
@@ -10,8 +11,10 @@ dist/
 # Python
 __pycache__/
 **/__pycache__/
+**pycache**/
 *.py[cod]
 *$py.class
+*.egg-info/
 
 # Virtual environments
 .venv/
@@ -22,11 +25,40 @@ env/
 .vscode/
 .idea/
 
-# Logs and test artifacts
+# Logs
 *.log
+# Testing / Coverage
 .pytest_cache/
 .coverage
 htmlcov/
 
 # Local Databricks state
 .databricks/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary Files
+tmp/
+temp/
+*.tmp
+
+# Model Outputs / Experiments
+outputs/
+results/
+artifacts/
+
+# Agent Evaluation Results
+eval_results/
+reports/
+
+# Local Downloads
+downloads/
+
+# Cache
+.cache/
