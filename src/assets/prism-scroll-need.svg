@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000">
+  <defs>
+    <radialGradient id="bg-a" cx="50%" cy="45%" r="70%">
+      <stop offset="0" stop-color="#2b2b2d"/>
+      <stop offset="0.42" stop-color="#101012"/>
+      <stop offset="1" stop-color="#020203"/>
+    </radialGradient>
+    <linearGradient id="glass-a" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.34"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.2"/>
+    </linearGradient>
+    <radialGradient id="halo-a" cx="50%" cy="48%" r="48%">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.94"/>
+      <stop offset="0.18" stop-color="#d7f0ff" stop-opacity="0.52"/>
+      <stop offset="0.44" stop-color="#5c6dff" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="blur-a">
+      <feGaussianBlur stdDeviation="30"/>
+    </filter>
+  </defs>
+  <rect width="1600" height="1000" fill="url(#bg-a)"/>
+  <path d="M-60 710 C250 520 410 880 720 610 C990 378 1130 505 1660 312" fill="none" stroke="#ffffff" stroke-opacity="0.24" stroke-width="34" filter="url(#blur-a)"/>
+  <path d="M-70 724 C250 548 420 884 724 623 C996 392 1130 514 1660 330" fill="none" stroke="#ffffff" stroke-opacity="0.9" stroke-width="5"/>
+  <circle cx="800" cy="500" r="370" fill="url(#halo-a)"/>
+  <g opacity="0.78">
+    <circle cx="800" cy="500" r="210" fill="none" stroke="url(#glass-a)" stroke-width="2"/>
+    <circle cx="800" cy="500" r="330" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="1.5"/>
+    <circle cx="800" cy="500" r="84" fill="#ffffff" fill-opacity="0.12" stroke="#ffffff" stroke-opacity="0.45"/>
+  </g>
+  <g fill="none" stroke="#ffffff" stroke-linecap="round">
+    <path d="M642 500h316" stroke-opacity="0.46" stroke-width="3"/>
+    <path d="M800 342v316" stroke-opacity="0.3" stroke-width="3"/>
+    <path d="M718 434c38-40 126-39 164 0" stroke-opacity="0.32" stroke-width="3"/>
+    <path d="M714 566c42 42 130 42 172 0" stroke-opacity="0.32" stroke-width="3"/>
+  </g>
+  <g opacity="0.38">
+    <rect x="420" y="705" width="760" height="78" rx="39" fill="#ffffff" fill-opacity="0.08" stroke="#ffffff" stroke-opacity="0.16"/>
+    <rect x="492" y="735" width="330" height="16" rx="8" fill="#ffffff" fill-opacity="0.34"/>
+    <rect x="852" y="735" width="210" height="16" rx="8" fill="#ffffff" fill-opacity="0.18"/>
+  </g>
+</svg>

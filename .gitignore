@@ -1,0 +1,32 @@
+node_modules/
+dist/
+.npm-cache/
+.env
+.env.*
+!.env.example
+.DS_Store
+*.tsbuildinfo
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs and test artifacts
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local Databricks state
+.databricks/

@@ -1,0 +1,9 @@
+command:
+  - npm
+  - run
+  - start
+env:
+  - name: PRISM_DATA_MODE
+    value: "databricks"
+  - name: PRISM_DATABRICKS_TABLE
+    value: "databricks_virtue_foundation_dataset_dais_2026.virtue_foundation_dataset.facilities"
