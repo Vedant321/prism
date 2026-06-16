@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import http from "node:http";
@@ -47,6 +48,16 @@ const server = http.createServer(async (req, res) => {
         message,
         profile: body.profile,
         history: Array.isArray(body.history) ? body.history : [],
+        recommendations: Array.isArray(body.recommendations) ? body.recommendations : [],
+      });
+
+      return sendJson(res, 200, result);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/openai-realtime-token") {
+      const body = await readJson(req, 128_000).catch(() => ({}));
+      const result = await createOpenAIRealtimeClientSecret({
+        profile: body.profile,
         recommendations: Array.isArray(body.recommendations) ? body.recommendations : [],
       });
 
@@ -374,6 +385,89 @@ async function runCodexChat({ message, profile, history, recommendations }) {
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+}
+
+async function createOpenAIRealtimeClientSecret({ profile, recommendations }) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    return {
+      ok: false,
+      error: "OPENAI_API_KEY is not configured on the server.",
+    };
+  }
+
+  const safeProfile = redactProfile(profile);
+  const topRecommendations = recommendations.slice(0, 3).map((item) => ({
+    facility: item?.facility?.name,
+    score: item?.score,
+    confidence: item?.confidence,
+    careNeed: item?.careNeed,
+    distanceKm: item?.facility?.distanceKm,
+    estimatedTravelTime: item?.estimatedTravelTime,
+    pricingSignal: item?.pricingSignal,
+  }));
+
+  const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+      "OpenAI-Safety-Identifier": stableSafetyIdentifier(safeProfile),
+    },
+    body: JSON.stringify({
+      session: {
+        type: "realtime",
+        model: process.env.OPENAI_REALTIME_MODEL ?? "gpt-realtime-2",
+        instructions: buildRealtimeInstructions({ profile: safeProfile, recommendations: topRecommendations }),
+        audio: {
+          output: {
+            voice: process.env.OPENAI_REALTIME_VOICE ?? "marin",
+          },
+        },
+      },
+    }),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    return {
+      ok: false,
+      error: data?.error?.message ?? data?.message ?? "OpenAI Realtime token request failed.",
+    };
+  }
+
+  return {
+    ok: true,
+    clientSecret: data.value,
+    expiresAt: data.expires_at ?? data.expiresAt,
+    model: process.env.OPENAI_REALTIME_MODEL ?? "gpt-realtime-2",
+  };
+}
+
+function buildRealtimeInstructions({ profile, recommendations }) {
+  return `You are Prism, a calm health concierge voice assistant.
+
+Speak naturally in short turns. Help the user clarify care needs, location, budget, travel time, transport options, pricing, availability, booking feasibility, what to expect during a visit, and evidence that a facility can provide the requested care.
+
+Do not diagnose, prescribe, or replace emergency care. If symptoms sound urgent, advise immediate local emergency care.
+
+Do not mention internal implementation details. Do not claim live Databricks results unless the user has recommendations in context.
+
+Profile context:
+${JSON.stringify(profile, null, 2)}
+
+Visible recommendation context:
+${JSON.stringify(recommendations, null, 2)}
+`;
+}
+
+function stableSafetyIdentifier(profile) {
+  const source = JSON.stringify({
+    role: profile?.role,
+    location: profile?.location,
+    name: profile?.name,
+  });
+  return createHash("sha256").update(source || "prism-demo-user").digest("hex");
 }
 
 function buildCodexPrompt({ message, profile, history, recommendations }) {
