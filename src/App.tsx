@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -37,6 +37,7 @@ import { answerPrompt, planJourney } from "./lib/ranking";
 import { cn, formatCurrency, uid } from "./lib/utils";
 import type {
   BudgetType,
+  BookingAutomationRequest,
   CareNeed,
   ChatMessage,
   Facility,
@@ -56,9 +57,17 @@ type DatabricksNearestResponse = {
   recommendations?: Recommendation[];
 };
 
+type QueryLogEntry = {
+  timestamp?: string;
+  label?: string;
+  query?: string;
+  parameters?: Record<string, unknown>;
+};
+
 const budgetOptions: BudgetType[] = ["Economy", "Balanced", "Luxury", "Elite"];
 const travelOptions: UserProfile["travelTime"][] = ["Quickest", "Standard", "Slow"];
 const transportOptions: TransportPreference[] = ["Ambulance", "Cab", "Train", "Own vehicle"];
+const pincodeOptions = ["302001", "302004", "302016", "302017", "302020", "302021", "302033"];
 
 export default function App() {
   const [entered, setEntered] = useState(false);
@@ -67,10 +76,16 @@ export default function App() {
   const [profileOpen, setProfileOpen] = useState(false);
   const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
   const [journeyPlan, setJourneyPlan] = useState<JourneyPlan | null>(null);
+  const [bookingRequest, setBookingRequest] = useState<BookingAutomationRequest | null>(null);
   const [shortlist, setShortlist] = useState<string[]>([]);
   const [speechPlaybackActive, setSpeechPlaybackActive] = useState(false);
   const [codexBusy, setCodexBusy] = useState(false);
   const voiceAssistantMessageIdsRef = useRef<Map<string, string>>(new Map());
+  const currentVoiceAssistantMessageIdRef = useRef<string | null>(null);
+  const currentVoiceAssistantMessageFinalRef = useRef(false);
+  const speechPlaybackActiveRef = useRef(false);
+  const recentVoiceAssistantTranscriptRef = useRef("");
+  const speechAudioRef = useRef<HTMLAudioElement | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>(() => [
     {
       id: uid("msg"),
@@ -82,36 +97,72 @@ export default function App() {
     },
   ]);
 
-  const currentCareNeed = recommendations[0]?.careNeed ?? "Dialysis";
+  const currentCareNeed = recommendations[0]?.careNeed ?? "Unknown";
   const shortlistedRecommendations = recommendations.filter((item) => shortlist.includes(item.facility.id));
   const setRealtimeSpeechActive = (active: boolean) => {
+    speechPlaybackActiveRef.current = active;
     setSpeechPlaybackActive((previous) => (previous === active ? previous : active));
   };
 
-  const handleVoiceUserTranscript = (transcript: string) => {
+  const speakSkillBackedReply = async (text: string) => {
+    const speakableText = makeVoiceSafeHealthcareText(text)
+      .replace(/\*\*/g, "")
+      .replace(/\[[^\]]+\]\([^)]+\)/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!speakableText) return;
+
+    speechAudioRef.current?.pause();
+    speechAudioRef.current = null;
+
+    try {
+      const response = await fetch("/api/openai-tts", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: speakableText.slice(0, 1800) }),
+      });
+      if (!response.ok) return;
+
+      const audio = new Audio(URL.createObjectURL(await response.blob()));
+      speechAudioRef.current = audio;
+      setRealtimeSpeechActive(true);
+      audio.onended = () => {
+        setRealtimeSpeechActive(false);
+        URL.revokeObjectURL(audio.src);
+        if (speechAudioRef.current === audio) speechAudioRef.current = null;
+      };
+      audio.onerror = () => {
+        setRealtimeSpeechActive(false);
+        URL.revokeObjectURL(audio.src);
+        if (speechAudioRef.current === audio) speechAudioRef.current = null;
+      };
+      await audio.play();
+    } catch {
+      setRealtimeSpeechActive(false);
+    }
+  };
+
+  const handleVoiceUserTranscript = async (transcript: string) => {
     const trimmed = transcript.trim();
     if (!trimmed) return;
-
-    const requestProfile = applyPromptProfileOverrides(profile, trimmed);
-    const localResult = answerPrompt(trimmed, requestProfile, recommendations);
-    setMessages((previous) => [
-      ...previous,
-      {
-        id: uid("msg"),
-        role: "user",
-        content: trimmed,
-        trace: ["voice_user_transcript: openai_realtime"],
-      },
-    ]);
-    setRecommendations(localResult.recommendations);
-    setJourneyPlan(localResult.journeyPlan ?? null);
-    if (/save|shortlist/i.test(trimmed) && localResult.recommendations[0]) {
-      setShortlist((previous) =>
-        previous.includes(localResult.recommendations[0].facility.id)
-          ? previous
-          : [...previous, localResult.recommendations[0].facility.id],
-      );
+    if (
+      isLikelyVoiceEchoTranscript({
+        transcript: trimmed,
+        recentAssistantTranscript: recentVoiceAssistantTranscriptRef.current,
+        assistantSpeaking: speechPlaybackActiveRef.current,
+      })
+    ) {
+      return;
     }
+
+    const routedTranscript = normalizeVoiceRoutingTranscript(trimmed);
+    const requestProfile = applyPromptProfileOverrides(profile, routedTranscript);
+    setProfile(requestProfile);
+    currentVoiceAssistantMessageIdRef.current = null;
+    currentVoiceAssistantMessageFinalRef.current = false;
+    voiceAssistantMessageIdsRef.current.clear();
+    const reply = await handleSend(routedTranscript, { source: "voice" });
+    if (reply?.content) await speakSkillBackedReply(reply.content);
   };
 
   const handleVoiceAssistantTranscript = (
@@ -120,15 +171,41 @@ export default function App() {
   ) => {
     const content = transcript.trim();
     if (!content) return;
+    recentVoiceAssistantTranscriptRef.current = content;
 
     setMessages((previous) => {
-      const existingMessageId = voiceAssistantMessageIdsRef.current.get(options.id);
+      const responseKey = voiceAssistantResponseKey(options.id);
+      const mappedMessageId = voiceAssistantMessageIdsRef.current.get(options.id) ?? voiceAssistantMessageIdsRef.current.get(responseKey);
+      const existingMessageId = mappedMessageId ?? currentVoiceAssistantMessageIdRef.current;
+      if (!mappedMessageId && existingMessageId && currentVoiceAssistantMessageFinalRef.current) {
+        return previous;
+      }
+
       if (existingMessageId) {
+        voiceAssistantMessageIdsRef.current.set(options.id, existingMessageId);
+        voiceAssistantMessageIdsRef.current.set(responseKey, existingMessageId);
+        if (options.final) currentVoiceAssistantMessageFinalRef.current = true;
         return previous.map((message) =>
           message.id === existingMessageId
             ? {
                 ...message,
-                content,
+                content: shouldReplaceVoiceTranscript(message.content, content) ? content : message.content,
+              }
+            : message,
+        );
+      }
+
+      const overlappingMessage = [...previous]
+        .reverse()
+        .find((message) => message.role === "assistant" && isVoiceAssistantMessage(message) && transcriptsOverlap(message.content, content));
+      if (overlappingMessage) {
+        voiceAssistantMessageIdsRef.current.set(options.id, overlappingMessage.id);
+        voiceAssistantMessageIdsRef.current.set(responseKey, overlappingMessage.id);
+        return previous.map((message) =>
+          message.id === overlappingMessage.id
+            ? {
+                ...message,
+                content: shouldReplaceVoiceTranscript(message.content, content) ? content : message.content,
               }
             : message,
         );
@@ -136,13 +213,15 @@ export default function App() {
 
       const messageId = uid("msg");
       voiceAssistantMessageIdsRef.current.set(options.id, messageId);
+      voiceAssistantMessageIdsRef.current.set(responseKey, messageId);
+      currentVoiceAssistantMessageIdRef.current = messageId;
+      currentVoiceAssistantMessageFinalRef.current = Boolean(options.final);
       return [
         ...previous,
         {
           id: messageId,
           role: "assistant",
           content,
-          citations: ["OpenAI Realtime voice"],
           trace: ["voice_assistant_transcript: openai_realtime"],
         },
       ];
@@ -150,29 +229,43 @@ export default function App() {
 
     if (options.final) {
       voiceAssistantMessageIdsRef.current.delete(options.id);
+      voiceAssistantMessageIdsRef.current.delete(voiceAssistantResponseKey(options.id));
     }
   };
 
-  const handleSend = async (prompt: string) => {
+  const handleSend = async (prompt: string, options: { source?: "voice" | "typed" } = {}) => {
     const trimmed = prompt.trim();
-    if (!trimmed || codexBusy) return;
+    if (!trimmed || codexBusy) return null;
     const requestProfile = applyPromptProfileOverrides(profile, trimmed);
+    setProfile(requestProfile);
 
     let localResult = answerPrompt(trimmed, requestProfile, recommendations);
     let skipLiveResponse = false;
 
-    if (isNearestPrompt(trimmed)) {
+    if (isIntercityTripPrompt(trimmed)) {
+      skipLiveResponse = true;
+      localResult = {
+        text: buildIntercityTripAnswer(trimmed),
+        recommendations,
+        journeyPlan: journeyPlan ?? undefined,
+        trace: ["travel_planning: intercity route comparison", "booking_assistant: transport options kept optional"],
+        citations: ["Prism trip planner"],
+      };
+    } else if (isNearestPrompt(trimmed)) {
+      const requestedCareNeed = detectCareNeedOverride(trimmed);
       const databricksResult = await callDatabricksNearest({
         profile: requestProfile,
-        careNeed: localResult.recommendations[0]?.careNeed ?? currentCareNeed,
+        careNeed: requestedCareNeed ?? localResult.recommendations[0]?.careNeed ?? currentCareNeed,
       });
 
       if (databricksResult.ok && databricksResult.recommendations.length > 0) {
         const top = databricksResult.recommendations[0];
-        const selectedCareNeed = top.careNeed ?? localResult.recommendations[0]?.careNeed ?? currentCareNeed;
+        const selectedCareNeed = requestedCareNeed ?? top.careNeed ?? localResult.recommendations[0]?.careNeed ?? currentCareNeed;
         skipLiveResponse = true;
         localResult = {
-          text: buildDatabricksNearestAnswer(top, requestProfile, selectedCareNeed),
+          text: buildDatabricksNearestAnswer(databricksResult.recommendations, requestProfile, selectedCareNeed, {
+            exposeBackendName: options.source !== "voice",
+          }),
           recommendations: databricksResult.recommendations,
           journeyPlan: planJourney(top, requestProfile),
           trace: [],
@@ -181,9 +274,15 @@ export default function App() {
       } else {
         skipLiveResponse = true;
         localResult = {
-          text: `I checked Databricks for nearest centers, but ${formatDatabricksError(
-            databricksResult.error,
-          )}. I am not showing the local demo centers as Databricks results.`,
+          text:
+            options.source === "voice"
+              ? `I checked the available facility data, but ${formatDatabricksError(
+                  databricksResult.error,
+                )
+                  .replace(/\bDatabricks\b/g, "facility data")}. I am not showing local demo centers as verified results.`
+              : `I checked Databricks for nearest centers, but ${formatDatabricksError(
+                  databricksResult.error,
+                )}. I am not showing the local demo centers as Databricks results.`,
           recommendations: [],
           trace: [],
           citations: ["Databricks connection"],
@@ -195,6 +294,7 @@ export default function App() {
       id: uid("msg"),
       role: "user",
       content: trimmed,
+      trace: options.source === "voice" ? ["voice_user_transcript: prism_skill_pipeline"] : undefined,
     };
 
     setMessages((previous) => [...previous, userMessage]);
@@ -214,9 +314,10 @@ export default function App() {
         role: "assistant",
         content: localResult.text,
         citations: localResult.citations,
+        trace: options.source === "voice" ? ["voice_response: databricks_skill_pipeline"] : undefined,
       };
       setMessages((previous) => [...previous, assistantMessage]);
-      return;
+      return assistantMessage;
     }
 
     setCodexBusy(true);
@@ -235,6 +336,7 @@ export default function App() {
         trace: [...codexResult.trace, ...localResult.trace],
       };
       setMessages((previous) => [...previous, assistantMessage]);
+      return assistantMessage;
     } catch (error) {
       const assistantMessage: ChatMessage = {
         id: uid("msg"),
@@ -244,6 +346,7 @@ export default function App() {
         trace: ["assistant_response: local fallback used", ...localResult.trace],
       };
       setMessages((previous) => [...previous, assistantMessage]);
+      return assistantMessage;
     } finally {
       setCodexBusy(false);
     }
@@ -257,6 +360,11 @@ export default function App() {
 
   const makeJourneyPlan = (recommendation: Recommendation) => {
     setJourneyPlan(planJourney(recommendation, profile));
+    setActiveTab("recommendations");
+  };
+
+  const prepareComputerUseBooking = (recommendation: Recommendation) => {
+    setBookingRequest(buildBookingAutomationRequest(recommendation, profile));
     setActiveTab("recommendations");
   };
 
@@ -301,6 +409,7 @@ export default function App() {
       <DashboardSummary
         profile={profile}
         careNeed={currentCareNeed}
+        topRecommendation={recommendations[0]}
         recommendationCount={recommendations.length}
         shortlistCount={shortlist.length}
         onNavigate={setActiveTab}
@@ -359,8 +468,10 @@ export default function App() {
             recommendations={recommendations}
             shortlist={shortlist}
             journeyPlan={journeyPlan}
+            bookingRequest={bookingRequest}
             onShortlist={toggleShortlist}
             onPlanJourney={makeJourneyPlan}
+            onPrepareBooking={prepareComputerUseBooking}
             onAsk={(prompt) => {
               setActiveTab("chat");
               handleSend(prompt);
@@ -382,22 +493,117 @@ export default function App() {
   );
 }
 
+function voiceAssistantResponseKey(id: string) {
+  return String(id).split(":")[0] || id;
+}
+
+function isVoiceAssistantMessage(message: ChatMessage) {
+  return message.trace?.some((item) => item.includes("voice_assistant_transcript")) ?? false;
+}
+
+function normalizeVoiceTranscript(value: string) {
+  return value.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function transcriptsOverlap(previous: string, next: string) {
+  const normalizedPrevious = normalizeVoiceTranscript(previous);
+  const normalizedNext = normalizeVoiceTranscript(next);
+  if (!normalizedPrevious || !normalizedNext) return false;
+  return normalizedPrevious.includes(normalizedNext) || normalizedNext.includes(normalizedPrevious);
+}
+
+function shouldReplaceVoiceTranscript(previous: string, next: string) {
+  const normalizedPrevious = normalizeVoiceTranscript(previous);
+  const normalizedNext = normalizeVoiceTranscript(next);
+  if (!normalizedNext) return false;
+  return normalizedNext.length >= normalizedPrevious.length || !normalizedPrevious.includes(normalizedNext);
+}
+
+function isLikelyVoiceEchoTranscript({
+  transcript,
+  recentAssistantTranscript,
+  assistantSpeaking,
+}: {
+  transcript: string;
+  recentAssistantTranscript: string;
+  assistantSpeaking: boolean;
+}) {
+  const normalized = normalizeVoiceTranscript(transcript);
+  const recentAssistant = normalizeVoiceTranscript(recentAssistantTranscript);
+  if (!normalized) return true;
+  if (recentAssistant && (recentAssistant.includes(normalized) || normalized.includes(recentAssistant))) return true;
+
+  const assistantEchoPhrases = [
+    "how can i assist you today",
+    "how can i assist you with your healthcare needs today",
+    "how may i assist you today",
+    "how can i help you today",
+    "what can i help you with today",
+  ];
+  if (assistantEchoPhrases.some((phrase) => normalized === phrase || normalized.startsWith(`${phrase} `))) return true;
+
+  const likelyGeneratedLogisticsLine =
+    /^i need to book (?:a |an )?(?:transport|cab|taxi|ambulance|hotel|appointment)\b/.test(normalized) &&
+    /\b(?:city hospital|hospital|check-?up|appointment)\b/.test(normalized);
+  if (likelyGeneratedLogisticsLine) return true;
+
+  return assistantSpeaking && normalized.length > 12 && !/\b(i am|i'm|my|near me|near|in|from|diagnosis|symptom|pain|surgery|hospital|doctor|book|need|want)\b/.test(normalized);
+}
+
 function DashboardSummary({
   profile,
   careNeed,
+  topRecommendation,
   recommendationCount,
   shortlistCount,
   onNavigate,
 }: {
   profile: UserProfile;
   careNeed: CareNeed;
+  topRecommendation?: Recommendation;
   recommendationCount: number;
   shortlistCount: number;
   onNavigate: (tab: Tab) => void;
 }) {
-  const roleLabel = profile.role === "patient" ? "Patient view" : "Coordinator view";
   const hasRecommendations = recommendationCount > 0;
   const hasShortlist = shortlistCount > 0;
+  const hasCareNeed = careNeed !== "Unknown";
+  const topFacility = topRecommendation?.facility;
+  const confirmationCount =
+    (topRecommendation?.missingEvidence.length ?? 0) + (topRecommendation?.suspiciousEvidence.length ?? 0);
+  const supportingSourceCount = topRecommendation?.supportingEvidence.length ?? 0;
+  const evidenceValue = topRecommendation
+    ? confirmationCount
+      ? "Confirm details"
+      : topRecommendation.confidence < 50
+        ? "Source check"
+        : "Looks supported"
+    : "Pending";
+  const evidenceDetail = topRecommendation
+    ? confirmationCount
+      ? `${confirmationCount} item(s) need confirmation`
+      : supportingSourceCount
+        ? `${supportingSourceCount} supporting source(s); no flagged gaps`
+        : "Facility returned; confirm by phone"
+    : "Run a search to score evidence";
+  const bestMatchValue = topFacility ? topFacility.name.replace("Prism Demo ", "") : "No facility yet";
+  const bestMatchDetail = topRecommendation
+    ? `${topFacility?.distanceKm.toFixed(1)} km, ${topRecommendation.estimatedTravelTime} min by ${profile.preferredTransportation.toLowerCase()}`
+    : "Ask for a facility search in chat";
+  const profileFields = [
+    profile.name,
+    profile.dateOfBirth,
+    profile.location,
+    profile.pincode,
+    profile.currentProblems,
+    profile.medicalHistory,
+    profile.insuranceNumber,
+    profile.governmentHealthCard,
+    profile.budgetType,
+    profile.travelTime,
+    profile.preferredTransportation,
+  ];
+  const completedProfileFields = profileFields.filter(Boolean).length;
 
   return (
     <section className="dashboard-command" aria-label="Dashboard summary">
@@ -415,7 +621,7 @@ function DashboardSummary({
         <p className="case-problem">{profile.currentProblems}</p>
 
         <div className="case-detail-grid">
-          <DashboardCaseDetail icon={<MapPin size={16} />} label="Location" value={profile.location} />
+          <DashboardCaseDetail icon={<MapPin size={16} />} label="Location" value={formatProfileLocation(profile)} />
           <DashboardCaseDetail icon={<Wallet size={16} />} label="Budget" value={profile.budgetType} />
           <DashboardCaseDetail icon={<Route size={16} />} label="Travel" value={profile.travelTime} />
           <DashboardCaseDetail icon={<Database size={16} />} label="Source" value={analyticsSnapshot.source} />
@@ -435,7 +641,7 @@ function DashboardSummary({
             <span>01</span>
             <div>
               <strong>Care focus</strong>
-              <small>{careNeed}</small>
+              <small>{careNeed === "Unknown" ? "Awaiting diagnosis or symptoms" : careNeed}</small>
             </div>
           </div>
           <div className={cn("case-step", hasRecommendations && "case-step-active")}>
@@ -466,28 +672,69 @@ function DashboardSummary({
       </article>
 
       <div className="dashboard-vitals">
-        <DashboardMetric icon={<Stethoscope size={18} />} label="Care focus" value={careNeed} detail={roleLabel} tone="teal" />
-        <DashboardMetric
-          icon={<Building2 size={18} />}
-          label="Ranked options"
-          value={recommendationCount ? recommendationCount.toString() : "0"}
-          detail="Current chat session"
-          tone="blue"
-        />
-        <DashboardMetric
-          icon={<BookmarkCheck size={18} />}
-          label="Saved"
-          value={shortlistCount.toString()}
-          detail="Shortlist items"
-          tone="amber"
-        />
-        <DashboardMetric
-          icon={<ShieldCheck size={18} />}
-          label="Evidence"
-          value={`${analyticsSnapshot.evidenceConfidence}%`}
-          detail={analyticsSnapshot.generatedAt}
-          tone="rose"
-        />
+        {hasRecommendations ? (
+          <>
+            <DashboardMetric
+              icon={<Stethoscope size={18} />}
+              label="Care need"
+              value={hasCareNeed ? careNeed : "Not clear yet"}
+              detail={hasCareNeed ? `Searching near ${profile.location || "selected location"}` : "Share diagnosis or symptoms"}
+              tone="teal"
+            />
+            <DashboardMetric
+              icon={<Building2 size={18} />}
+              label="Best match"
+              value={bestMatchValue}
+              detail={bestMatchDetail}
+              tone="blue"
+            />
+            <DashboardMetric
+              icon={<BookmarkCheck size={18} />}
+              label="Next action"
+              value="Review options"
+              detail={`${recommendationCount} ranked option(s), ${shortlistCount} saved`}
+              tone="amber"
+            />
+            <DashboardMetric
+              icon={<ShieldCheck size={18} />}
+              label="Evidence check"
+              value={evidenceValue}
+              detail={evidenceDetail}
+              tone="rose"
+            />
+          </>
+        ) : (
+          <>
+            <DashboardMetric
+              icon={<UserRound size={18} />}
+              label="Intake status"
+              value="Profile loaded"
+              detail={`${completedProfileFields}/${profileFields.length} profile fields ready`}
+              tone="teal"
+            />
+            <DashboardMetric
+              icon={<MapPin size={18} />}
+              label="Location context"
+              value={formatProfileLocation(profile)}
+              detail={`${profile.preferredTransportation.toLowerCase()}, ${profile.travelTime.toLowerCase()} route`}
+              tone="blue"
+            />
+            <DashboardMetric
+              icon={<Wallet size={18} />}
+              label="Care preferences"
+              value={profile.budgetType}
+              detail={`${profile.role === "patient" ? "Patient" : "Coordinator"} view is active`}
+              tone="amber"
+            />
+            <DashboardMetric
+              icon={<Database size={18} />}
+              label="Data fetch"
+              value="Ready"
+              detail="Chat will query live facility data"
+              tone="rose"
+            />
+          </>
+        )}
       </div>
     </section>
   );
@@ -562,8 +809,31 @@ async function callCodexCli({
 }
 
 function isNearestPrompt(prompt: string) {
-  return /\b(nearest|nearby|closest|near me|near|around|find|need|care|treatment|center|centre|hospital|clinic|facility|pricing|availability|booking|evidence|handle|expect)\b/i.test(
+  return /\b(nearest|nearby|closest|near me|near|around|find|good|want|need|care|treatment|surgery|operation|procedure|surgeon|specialist|cardio|cardiac|cardiology|heart|centers?|centres?|hospitals?|clinics?|facilit(?:y|ies)|pricing|availability|booking|evidence|handle|expect)\b/i.test(
     prompt,
+  );
+}
+
+function isIntercityTripPrompt(prompt: string) {
+  const normalized = prompt.toLowerCase();
+  return /\b(trip|travel|route|transport|train|bus|flight|cab)\b/.test(normalized) && /\bfrom\s+jaipur\b/.test(normalized) && /\bto\s+delhi\b/.test(normalized);
+}
+
+function detectCareNeedOverride(prompt: string): CareNeed | null {
+  const normalized = prompt.toLowerCase();
+  if (/\b(dialysis|renal|kidney|ckd|nephro)\b/.test(normalized)) return "Dialysis";
+  if (/\b(cardio|cardiac|cardiology|heart|bypass|angioplasty|valve|ecg|echo)\b/.test(normalized)) return "Cardiology";
+  if (/\bcareer\s+(?:facilit(?:y|ies)|hospitals?|clinics?|centers?|centres?|care|specialists?)\b/.test(normalized)) return "Cardiology";
+  if (/\b(trauma|emergency|accident|icu|critical)\b/.test(normalized)) return "Trauma";
+  if (/\b(maternity|pregnancy|obstetric|gynecology|gynaecology)\b/.test(normalized)) return "Maternity";
+  if (/\b(oncology|cancer|chemo|radiation)\b/.test(normalized)) return "Oncology";
+  return null;
+}
+
+function normalizeVoiceRoutingTranscript(transcript: string) {
+  return transcript.replace(
+    /\bcareer\s+(?=(?:facilit(?:y|ies)|hospitals?|clinics?|centers?|centres?|care|specialists?))/gi,
+    "cardio ",
   );
 }
 
@@ -571,13 +841,69 @@ function applyPromptProfileOverrides(profile: UserProfile, prompt: string): User
   return {
     ...profile,
     location: detectLocationOverride(prompt) ?? profile.location,
+    pincode: detectPincodeOverride(prompt) ?? profile.pincode,
     budgetType: detectBudgetOverride(prompt) ?? profile.budgetType,
     travelTime: detectTravelOverride(prompt) ?? profile.travelTime,
     preferredTransportation: detectTransportOverride(prompt) ?? profile.preferredTransportation,
   };
 }
 
+function buildBookingAutomationRequest(recommendation: Recommendation, profile: UserProfile): BookingAutomationRequest {
+  const facility = recommendation.facility;
+  const careNeed = recommendation.careNeed;
+  const patientLocation = formatProfileLocation(profile);
+  const handoffPrompt = [
+    `Use Codex browser/computer control to help book or confirm an appointment for ${facility.name}.`,
+    `Care need: ${careNeed}.`,
+    `Patient: ${profile.name}, location ${patientLocation}.`,
+    `Facility phone or booking detail: ${facility.phone}; ${facility.booking}.`,
+    "First find the official hospital booking page or phone/appointment channel.",
+    "Do not submit any form, place any call, send any message, or share patient identifiers until the user explicitly confirms the exact action and details.",
+    "If an official online booking page is unavailable, prepare the phone script and stop for user confirmation.",
+  ].join("\n");
+
+  return {
+    id: uid("booking"),
+    facilityName: facility.name,
+    facilityPhone: facility.phone,
+    bookingInstruction: facility.booking,
+    careNeed,
+    patientName: profile.name,
+    patientLocation: profile.location,
+    patientPincode: profile.pincode,
+    preferredDate: "Ask user",
+    status: "needs_confirmation",
+    checklist: [
+      "Confirm patient name, phone number, appointment date, and care department.",
+      "Use the official hospital site or listed phone channel only.",
+      "Stop before submitting forms, placing calls, or sharing identifiers.",
+      "After confirmation, record booking reference, appointment time, and required documents.",
+    ],
+    handoffPrompt,
+  };
+}
+
+function formatProfileLocation(profile: UserProfile) {
+  return [profile.location, profile.pincode].filter(Boolean).join(" - ");
+}
+
 function detectLocationOverride(prompt: string) {
+  const knownLocations: Record<string, string> = {
+    jaipur: "Jaipur, Rajasthan",
+    delhi: "Delhi",
+    mumbai: "Mumbai",
+    patna: "Patna, Bihar",
+    chennai: "Chennai, Tamil Nadu",
+    surat: "Surat, Gujarat",
+    noida: "Noida, Uttar Pradesh",
+    bengaluru: "Bengaluru, Karnataka",
+    bangalore: "Bengaluru, Karnataka",
+  };
+  const normalized = prompt.toLowerCase();
+  for (const [needle, label] of Object.entries(knownLocations)) {
+    if (new RegExp(`\\b(?:near|in|around|from)\\s+${needle}\\b`, "i").test(normalized)) return label;
+  }
+
   const match = prompt.match(/\b(?:near|in|around|from)\s+([A-Z][A-Za-z\s]+?)(?:[,.;!?]|$|\s+(?:with|for|and|economy|balanced|luxury|elite|budget|cab|ambulance|train|quickest|fastest|nearby|hospital|clinic|center|centre))/);
   if (!match) return null;
 
@@ -585,6 +911,11 @@ function detectLocationOverride(prompt: string) {
   if (!location || location.length < 2) return null;
 
   return location;
+}
+
+function detectPincodeOverride(prompt: string) {
+  const match = prompt.match(/\b(?:pin\s*code|pincode|postal\s*code|zip)\s*(?:is|:)?\s*(\d{6})\b|\b(\d{6})\b/iu);
+  return match?.[1] ?? match?.[2] ?? null;
 }
 
 function detectBudgetOverride(prompt: string): BudgetType | null {
@@ -647,21 +978,80 @@ async function callDatabricksNearest({
   };
 }
 
-function buildDatabricksNearestAnswer(recommendation: Recommendation, profile: UserProfile, careNeed: CareNeed) {
-  const facility = recommendation.facility;
-  const selectedTravelMinutes = facility.travelTimes[profile.preferredTransportation] ?? recommendation.estimatedTravelTime;
-  const evidence = recommendation.supportingEvidence[0];
-  const missingEvidence = recommendation.missingEvidence.length
-    ? recommendation.missingEvidence.join("; ")
-    : "direct equipment list, same-day availability, final price, and booking rules still need phone confirmation";
+function buildIntercityTripAnswer(prompt: string) {
+  const wantsCheapest = /\b(cheap|cheapest|economy|budget|affordable)\b/i.test(prompt);
+  const lead = wantsCheapest
+    ? "The most affordable Jaipur-to-Delhi medical trip options are government bus or sleeper train."
+    : "For a Jaipur-to-Delhi medical trip, choose the mode based on stability, comfort, and appointment timing.";
+  return [
+    `${lead} Government bus is usually around ₹350-₹550, and train sleeper class is around ₹200-₹350.`,
+    "For comfort without jumping too high in cost, Volvo AC bus is roughly ₹700-₹1,200 and AC 3-tier train is roughly ₹500-₹900.",
+    "For speed, flights can start around ₹1,500 and take about 45 minutes in the air, but airport time at both ends usually makes the total trip longer.",
+    "For door-to-door convenience, a private outstation cab is usually around ₹2,500-₹4,500 for the vehicle; shared cab can be cheaper per person if available.",
+    "If the patient has chest pain, severe breathlessness, fainting, confusion, or unstable vitals, do not use routine transport; use emergency care or ambulance support.",
+    "Optional next step: tell me the Delhi hospital or area and travel date, and I can narrow this to one route.",
+  ].join("\n\n");
+}
+
+function makeVoiceSafeHealthcareText(text: string) {
+  return text
+    .replace(/\bDatabricks claim score\b/gi, "facility evidence score")
+    .replace(/\bDatabricks did not return\b/gi, "the facility data did not include")
+    .replace(/\bDatabricks returned\b/gi, "the available facility data returned")
+    .replace(/\breturned from Databricks\b/gi, "matched the available facility data")
+    .replace(/\bfrom Databricks capability fields\b/gi, "from available capability fields")
+    .replace(/\bDatabricks connection\b/gi, "facility data connection")
+    .replace(/\bDatabricks results\b/gi, "verified facility results")
+    .replace(/\bDatabricks row\b/gi, "facility data row")
+    .replace(/\bDatabricks\b/gi, "the facility data")
+    .replace(/\bSQL\b/g, "data")
+    .replace(/\bquery logs?\b/gi, "data trace");
+}
+
+function buildDatabricksNearestAnswer(
+  recommendations: Recommendation[],
+  profile: UserProfile,
+  careNeed: CareNeed,
+  options: { exposeBackendName?: boolean } = {},
+) {
+  const topOptions = recommendations.slice(0, 3);
+  const top = topOptions[0];
+  const facility = top.facility;
+  const exposeBackendName = options.exposeBackendName ?? true;
+  const dataSourceLabel = exposeBackendName ? "Databricks" : "the available facility data";
+  const selectedTravelMinutes = facility.travelTimes[profile.preferredTransportation] ?? top.estimatedTravelTime;
+  const hasClaimScore = top.claimScore !== undefined && top.claimScore !== null && top.claimScore > 0;
+  const confidenceText = hasClaimScore
+    ? `${exposeBackendName ? "Databricks claim score" : "Facility evidence score"} ${top.claimScore?.toFixed(0)}${
+        top.claimScoreBand ? ` (${top.claimScoreBand})` : ""
+      }`
+    : exposeBackendName
+      ? "Databricks did not return a usable claim score for this row"
+      : "The facility data did not include a usable evidence score for this row";
+  const candidateLines = topOptions
+    .map((item, index) => {
+      const itemFacility = item.facility;
+      const claim =
+        item.claimScore !== undefined && item.claimScore !== null && item.claimScore > 0
+          ? `claim ${item.claimScore.toFixed(0)}${item.claimScoreBand ? ` ${item.claimScoreBand}` : ""}`
+          : "claim score not returned";
+      return `${index + 1}. **${itemFacility.name}** - ${itemFacility.distanceKm.toFixed(1)} km, about ${
+        item.estimatedTravelTime
+      } minutes by cab, ${claim}`;
+    })
+    .join("\n\n");
+  const missingEvidence = top.missingEvidence.length
+    ? top.missingEvidence.join("; ")
+    : "equipment list, same-day availability, final price, and booking rules still need phone confirmation";
+  const missingEvidenceText = exposeBackendName ? missingEvidence : makeVoiceSafeHealthcareText(missingEvidence);
 
   return [
-    `Based on the diagnosis/care need I have so far, **${facility.name}** is the nearest capability match for **${careNeed.toLowerCase()}** near **${profile.location}**: ${facility.distanceKm.toFixed(
+    `For **${careNeed.toLowerCase()}** near **${profile.location}**, ${dataSourceLabel} returned these candidate facilities:`,
+    candidateLines,
+    `The closest candidate is **${facility.name}**: ${facility.distanceKm.toFixed(
       1,
-    )} km away, about ${selectedTravelMinutes} minutes by ${profile.preferredTransportation.toLowerCase()}.`,
-    `Capability evidence: ${facility.services.join(", ")}. Supporting source: ${evidence?.label ?? "Databricks facility row"} from ${evidence?.source ?? "Databricks"}, freshness ${
-      evidence?.freshness ?? "not listed"
-    }, confidence ${recommendation.confidence}%. Missing or uncertain: ${missingEvidence}.`,
+    )} km away, about ${selectedTravelMinutes} minutes by ${profile.preferredTransportation.toLowerCase()}. ${confidenceText}.`,
+    `Capability evidence fields: ${facility.services.join(", ")}. Missing or uncertain: ${missingEvidenceText}.`,
     "Optional next step: would you like help confirming booking for this facility, or should we stop here? Transport comes after booking intent, and hotel stays last only if an overnight stay is needed.",
   ].join("\n\n");
 }
@@ -792,6 +1182,21 @@ function ProfileForm({
         <input value={profile.location} onChange={(event) => setField("location", event.target.value)} />
       </label>
       <label>
+        Pincode
+        <input
+          list="profile-pincode-options"
+          inputMode="numeric"
+          pattern="[0-9]*"
+          value={profile.pincode}
+          onChange={(event) => setField("pincode", event.target.value)}
+        />
+        <datalist id="profile-pincode-options">
+          {pincodeOptions.map((option) => (
+            <option key={option} value={option} />
+          ))}
+        </datalist>
+      </label>
+      <label>
         Current medical problems
         <textarea
           value={profile.currentProblems}
@@ -874,55 +1279,72 @@ function InsightsTab({
       return acc;
     }, {});
   }, []);
-  const maxRegionCount = Math.max(...Object.values(regionCounts));
   const regions = Object.keys(regionCounts);
+  const activeRecommendations = recommendations;
+  const activeFacilities = activeRecommendations.length
+    ? activeRecommendations.map((recommendation) => recommendation.facility)
+    : facilities;
+  const activeRegionCounts = activeFacilities.reduce<Record<string, number>>((acc, facility) => {
+    acc[facility.region] = (acc[facility.region] ?? 0) + 1;
+    return acc;
+  }, {});
+  const activeMaxRegionCount = Math.max(...Object.values(activeRegionCounts), 1);
+  const dashboardSource = activeRecommendations.length ? "Current findings" : analyticsSnapshot.source;
+  const activeCareNeed = activeRecommendations[0]?.careNeed ?? "All care needs";
+  const activeAverageConfidence = Math.round(
+    activeFacilities.reduce((sum, facility) => sum + facility.evidenceConfidence, 0) / Math.max(activeFacilities.length, 1),
+  );
+  const activeMissingEvidence = activeFacilities.reduce((sum, facility) => sum + facility.missingEvidence.length, 0);
+  const closestFindingDistance = activeRecommendations.length
+    ? `${Math.min(...activeRecommendations.map((item) => item.facility.distanceKm)).toFixed(1)} km`
+    : "n/a";
+  const activeRegions = Object.keys(activeRegionCounts);
   const priceGroups = budgetOptions.map((budget, index) => ({
     budget,
-    count: facilities.filter((facility) => facility.priceIndex === index + 1).length,
+    count: activeFacilities.filter((facility) => facility.priceIndex === index + 1).length,
   }));
-  const activeRecommendations = recommendations.slice(0, 4);
 
   return (
     <div className="insights-layout">
       <section className="kpi-grid">
         <Kpi
           icon={<Building2 size={20} />}
-          value={analyticsSnapshot.facilityCount.toString()}
-          label="Facilities in registry"
-          detail={`Actual, Jaipur region, ${analyticsSnapshot.generatedAt}`}
+          value={activeFacilities.length.toString()}
+          label={activeRecommendations.length ? "Facilities in findings" : "Facilities in registry"}
+          detail={`${activeCareNeed}, ${profile.location}`}
         />
         <Kpi
           icon={<ShieldCheck size={20} />}
-          value={`${analyticsSnapshot.evidenceConfidence}%`}
+          value={`${activeAverageConfidence}%`}
           label="Evidence confidence"
-          detail="Actual average after source-quality checks"
+          detail={activeRecommendations.length ? "Average for current findings" : "Registry average after source-quality checks"}
         />
         <Kpi
           icon={<AlertTriangle size={20} />}
-          value={analyticsSnapshot.missingPriceFields.toString()}
-          label="Missing price fields"
-          detail="Actual count, lower is better"
+          value={activeMissingEvidence.toString()}
+          label="Missing evidence"
+          detail={activeRecommendations.length ? "Current findings requiring confirmation" : "Registry evidence gaps"}
         />
         <Kpi
           icon={<Activity size={20} />}
-          value={`${analyticsSnapshot.referralCompletionRate}%`}
-          label="Referral completion"
-          detail="Prior 30-day demo referrals"
+          value={closestFindingDistance}
+          label="Closest option"
+          detail={activeRecommendations.length ? `${profile.preferredTransportation}, ${profile.travelTime}` : "Run a finding to calculate"}
         />
       </section>
 
       <section className="chart-grid">
         <article className="data-panel panel-wide">
           <PanelHeader
-            title="Facility distribution by region - actual count, demo snapshot"
-            source={analyticsSnapshot.source}
+            title={activeRecommendations.length ? "Current findings by region" : "Facility distribution by region"}
+            source={dashboardSource}
           />
           <div className="bar-list">
-            {Object.entries(regionCounts).map(([region, count]) => (
+            {Object.entries(activeRegionCounts).map(([region, count]) => (
               <div className="bar-row" key={region}>
                 <span>{region}</span>
                 <div className="bar-track">
-                  <div className="bar-fill teal" style={{ width: `${(count / maxRegionCount) * 100}%` }} />
+                  <div className="bar-fill teal" style={{ width: `${(count / activeMaxRegionCount) * 100}%` }} />
                 </div>
                 <strong>{count}</strong>
               </div>
@@ -931,20 +1353,20 @@ function InsightsTab({
         </article>
 
         <article className="data-panel">
-          <PanelHeader title="Care availability by region" source="Demo care service map" />
+          <PanelHeader title="Care availability by region" source={dashboardSource} />
           <div className="availability-grid">
             <span />
             {careNeeds.slice(0, 5).map((need) => (
               <strong key={need}>{need}</strong>
             ))}
-            {regions.map((region) => (
-              <CareRegionRow key={region} region={region} />
+            {(activeRecommendations.length ? activeRegions : regions).map((region) => (
+              <CareRegionRow key={region} region={region} facilitiesForRegion={activeFacilities} />
             ))}
           </div>
         </article>
 
         <article className="data-panel">
-          <PanelHeader title="Price ranges by budget tier" source="Demo price ranges" />
+          <PanelHeader title="Price ranges by budget tier" source={dashboardSource} />
           <div className="price-stack">
             {priceGroups.map((group) => (
               <div key={group.budget} className="price-block">
@@ -959,7 +1381,7 @@ function InsightsTab({
         </article>
 
         <article className="data-panel panel-wide">
-          <PanelHeader title="Distance and travel-time comparison for current shortlist" source="Prism ranking output" />
+          <PanelHeader title="Distance and travel-time comparison for current findings" source="Prism ranking output" />
           {activeRecommendations.length > 0 ? (
             <div className="comparison-table">
               <div className="table-head">
@@ -968,7 +1390,7 @@ function InsightsTab({
                 <span>Travel</span>
                 <span>Score</span>
               </div>
-              {activeRecommendations.map((item) => (
+              {activeRecommendations.slice(0, 4).map((item) => (
                 <div className="table-row" key={item.facility.id}>
                   <span>{item.facility.name}</span>
                   <span>{item.facility.distanceKm.toFixed(1)} km</span>
@@ -985,9 +1407,9 @@ function InsightsTab({
         </article>
 
         <article className="data-panel">
-          <PanelHeader title="Evidence confidence and missing-data indicators" source="Demo evidence quality" />
+          <PanelHeader title="Evidence confidence and missing-data indicators" source={dashboardSource} />
           <div className="quality-list">
-            {facilities.slice(0, 5).map((facility) => (
+            {activeFacilities.slice(0, 5).map((facility) => (
               <div key={facility.id} className="quality-row">
                 <span>{facility.name.replace("Prism Demo ", "")}</span>
                 <Meter value={facility.evidenceConfidence} />
@@ -1079,10 +1501,11 @@ function ChatTab({
           <div className="chat-heading-actions">
             <OpenAIVoiceChat
               profile={profile}
-              recommendations={recommendations}
-              disabled={codexBusy}
-              onSpeechActivityChange={setRealtimeSpeechActive}
-              onTranscript={onVoiceUserTranscript}
+            recommendations={recommendations}
+            externalPlaybackActive={speechPlaybackActive}
+            disabled={codexBusy}
+            onSpeechActivityChange={setRealtimeSpeechActive}
+            onTranscript={onVoiceUserTranscript}
               onAssistantTranscript={onVoiceAssistantTranscript}
             />
           </div>
@@ -1127,6 +1550,8 @@ function ChatTab({
       </section>
 
       <aside className="agent-rail">
+        <QueryLogPanel />
+
         <GlowCard className="agent-panel" glowColor="purple">
           <PanelHeader title="Agent skills" source="Local Prism orchestration" />
           <div className="skill-list">
@@ -1165,14 +1590,131 @@ function ChatTab({
   );
 }
 
+function QueryLogPanel() {
+  const [entries, setEntries] = useState<QueryLogEntry[]>([]);
+  const [streamStatus, setStreamStatus] = useState<"connecting" | "streaming" | "offline">("connecting");
+  const latestEntry = entries[0];
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadEntries = () => {
+      fetch("/api/query-logs?limit=25")
+        .then((response) => response.json())
+        .then((data: { entries?: QueryLogEntry[] }) => {
+          if (!cancelled) setEntries(data.entries ?? []);
+        })
+        .catch(() => {
+          if (!cancelled) setStreamStatus("offline");
+        });
+    };
+
+    loadEntries();
+    const refreshTimer = window.setInterval(loadEntries, 2500);
+
+    if (!("EventSource" in window)) {
+      setStreamStatus("offline");
+      return () => {
+        cancelled = true;
+        window.clearInterval(refreshTimer);
+      };
+    }
+
+    const source = new EventSource("/api/query-log-stream?replay=5");
+    source.addEventListener("open", () => {
+      if (!cancelled) setStreamStatus("streaming");
+    });
+    source.addEventListener("ready", () => {
+      if (!cancelled) setStreamStatus("streaming");
+    });
+    source.addEventListener("entry", (event) => {
+      if (cancelled) return;
+      setStreamStatus("streaming");
+      const entry = safeParseQueryLogEntry((event as MessageEvent).data);
+      if (!entry) return;
+      setEntries((current) => {
+        const key = `${entry.timestamp}-${entry.label}-${entry.query}`;
+        const withoutDuplicate = current.filter((item) => `${item.timestamp}-${item.label}-${item.query}` !== key);
+        return [entry, ...withoutDuplicate].slice(0, 25);
+      });
+    });
+    source.addEventListener("error", () => {
+      if (cancelled) return;
+      setStreamStatus(source.readyState === EventSource.CLOSED ? "offline" : "connecting");
+    });
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(refreshTimer);
+      source.close();
+    };
+  }, []);
+
+  return (
+    <GlowCard className="agent-panel query-log-panel" glowColor="blue">
+      <div className="query-log-header">
+        <PanelHeader title="Query log" source="Main dashboard stream" />
+        <span className={cn("stream-badge", streamStatus === "streaming" && "stream-badge-live")}>
+          {streamStatus === "streaming" ? "Streaming" : streamStatus === "connecting" ? "Connecting" : "Offline"}
+        </span>
+      </div>
+
+      <div className="query-log-live-box" aria-live="polite">
+        {latestEntry ? (
+          <>
+            <div className="query-log-meta">
+              <span>{formatLogTime(latestEntry.timestamp)}</span>
+              <strong>{latestEntry.label ?? "query"}</strong>
+            </div>
+            <code>{latestEntry.query}</code>
+            {latestEntry.parameters && (
+              <pre>{JSON.stringify(latestEntry.parameters, null, 2)}</pre>
+            )}
+          </>
+        ) : (
+          <p>No query logs yet.</p>
+        )}
+      </div>
+
+      {entries.length > 1 && (
+        <div className="query-log-list">
+          {entries.slice(1, 5).map((entry, index) => (
+            <div key={`${entry.timestamp}-${entry.label}-${index}`} className="query-log-row">
+              <span>{formatLogTime(entry.timestamp)}</span>
+              <strong>{entry.label ?? "query"}</strong>
+            </div>
+          ))}
+        </div>
+      )}
+    </GlowCard>
+  );
+}
+
+function safeParseQueryLogEntry(value: string) {
+  try {
+    return JSON.parse(value) as QueryLogEntry;
+  } catch {
+    return null;
+  }
+}
+
+function formatLogTime(value?: string) {
+  if (!value) return "No timestamp";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
 function RecommendationsTab({
   profile,
   careNeed,
   recommendations,
   shortlist,
   journeyPlan,
+  bookingRequest,
   onShortlist,
   onPlanJourney,
+  onPrepareBooking,
   onAsk,
 }: {
   profile: UserProfile;
@@ -1180,8 +1722,10 @@ function RecommendationsTab({
   recommendations: Recommendation[];
   shortlist: string[];
   journeyPlan: JourneyPlan | null;
+  bookingRequest: BookingAutomationRequest | null;
   onShortlist: (facilityId: string) => void;
   onPlanJourney: (recommendation: Recommendation) => void;
+  onPrepareBooking: (recommendation: Recommendation) => void;
   onAsk: (prompt: string) => void;
 }) {
   if (recommendations.length === 0) {
@@ -1219,10 +1763,13 @@ function RecommendationsTab({
             saved={shortlist.includes(recommendation.facility.id)}
             onShortlist={() => onShortlist(recommendation.facility.id)}
             onPlanJourney={() => onPlanJourney(recommendation)}
+            onPrepareBooking={() => onPrepareBooking(recommendation)}
             role={profile.role}
           />
         ))}
       </section>
+
+      {bookingRequest && <BookingAutomationPanel request={bookingRequest} />}
 
       {journeyPlan && (
         <section className="journey-panel">
@@ -1252,12 +1799,43 @@ function RecommendationsTab({
   );
 }
 
+function BookingAutomationPanel({ request }: { request: BookingAutomationRequest }) {
+  return (
+    <section className="booking-automation-panel">
+      <PanelHeader title="Computer booking handoff" source="Codex controlled action" />
+      <div className="booking-automation-grid">
+        <InfoPill icon={<Building2 size={16} />} label={request.facilityName} />
+        <InfoPill icon={<Stethoscope size={16} />} label={request.careNeed} />
+        <InfoPill icon={<MapPin size={16} />} label={`${request.patientLocation} - ${request.patientPincode}`} />
+        <InfoPill icon={<Phone size={16} />} label={request.facilityPhone} />
+      </div>
+      <div className="booking-automation-columns">
+        <div>
+          <h3>Before Codex books</h3>
+          {request.checklist.map((item) => (
+            <p key={item}>{item}</p>
+          ))}
+        </div>
+        <div>
+          <h3>Handoff prompt</h3>
+          <pre>{request.handoffPrompt}</pre>
+        </div>
+      </div>
+      <div className="booking-automation-note">
+        <AlertTriangle size={16} />
+        <span>Codex can help navigate and prepare the booking, but submitting forms, making calls, or sharing patient identifiers needs your explicit confirmation.</span>
+      </div>
+    </section>
+  );
+}
+
 function RecommendationCard({
   index,
   recommendation,
   saved,
   onShortlist,
   onPlanJourney,
+  onPrepareBooking,
   role,
 }: {
   index: number;
@@ -1265,6 +1843,7 @@ function RecommendationCard({
   saved: boolean;
   onShortlist: () => void;
   onPlanJourney: () => void;
+  onPrepareBooking: () => void;
   role: UserRole;
 }) {
   const facility = recommendation.facility;
@@ -1295,6 +1874,12 @@ function RecommendationCard({
           <InfoPill icon={<MapPin size={16} />} label={`${facility.distanceKm.toFixed(1)} km away`} />
           <InfoPill icon={<Clock size={16} />} label={`${recommendation.estimatedTravelTime} min estimated`} />
           <InfoPill icon={<Wallet size={16} />} label={recommendation.pricingSignal} />
+          {recommendation.claimScore !== undefined && recommendation.claimScore !== null && (
+            <InfoPill
+              icon={<ShieldCheck size={16} />}
+              label={`Claim ${recommendation.claimScore.toFixed(0)}${recommendation.claimScoreBand ? ` (${recommendation.claimScoreBand})` : ""}`}
+            />
+          )}
           <InfoPill icon={<Phone size={16} />} label={facility.booking} />
         </div>
 
@@ -1314,6 +1899,10 @@ function RecommendationCard({
           <button type="button" className="primary-button compact-button" onClick={onPlanJourney}>
             <TrainFront size={16} />
             Plan trip
+          </button>
+          <button type="button" className="icon-text-button" onClick={onPrepareBooking}>
+            <Bot size={16} />
+            Computer booking
           </button>
           <button type="button" className="icon-text-button" onClick={onShortlist}>
             {saved ? <BookmarkCheck size={16} /> : <Bookmark size={16} />}
@@ -1337,6 +1926,17 @@ function EvidenceSection({ recommendation }: { recommendation: Recommendation })
           </p>
         ))}
       </div>
+      {recommendation.claimScoreBreakdown && (
+        <div className="evidence-block score-breakdown">
+          <h4>Claim score</h4>
+          {scoreBreakdownRows(recommendation).map((item) => (
+            <p key={item.label}>
+              <strong>{item.value}</strong> {item.label}
+              <span>{item.detail}</span>
+            </p>
+          ))}
+        </div>
+      )}
       <div className="evidence-block missing">
         <h4>Missing evidence</h4>
         {recommendation.missingEvidence.length ? (
@@ -1355,6 +1955,47 @@ function EvidenceSection({ recommendation }: { recommendation: Recommendation })
       </div>
     </div>
   );
+}
+
+function scoreBreakdownRows(recommendation: Recommendation) {
+  const breakdown = recommendation.claimScoreBreakdown;
+  if (!breakdown) return [];
+
+  return [
+    {
+      label: "Composite validity",
+      value: recommendation.claimScore !== undefined && recommendation.claimScore !== null ? recommendation.claimScore.toFixed(0) : "n/a",
+      detail: recommendation.claimScoreBand ? `${recommendation.claimScoreBand} credibility band` : "No score band returned",
+    },
+    {
+      label: "Semantic corroboration",
+      value: formatScorePart(breakdown.semanticCorroboration),
+      detail: "Specialties backed by procedures, equipment, or capabilities",
+    },
+    {
+      label: "Evidence density",
+      value: formatScorePart(breakdown.evidenceDensity),
+      detail: `${breakdown.evidenceItems ?? 0} procedure/equipment evidence item(s)`,
+    },
+    {
+      label: "Consistency",
+      value: formatScorePart(breakdown.consistency),
+      detail:
+        breakdown.doctorCapacityRatio !== undefined && breakdown.doctorCapacityRatio !== null
+          ? `Doctor/capacity ratio ${breakdown.doctorCapacityRatio.toFixed(2)}`
+          : "Doctor/capacity ratio not returned",
+    },
+    {
+      label: "Digital footprint",
+      value: formatScorePart(breakdown.digitalFootprint),
+      detail: "Website, social presence, followers, and recent posting",
+    },
+  ];
+}
+
+function formatScorePart(value?: number | null) {
+  if (value === undefined || value === null || !Number.isFinite(value)) return "n/a";
+  return `${Math.round(value * 100)}%`;
 }
 
 function MessageBubble({ message, isSpeaking = false }: { message: ChatMessage; isSpeaking?: boolean }) {
@@ -1403,12 +2044,12 @@ function Kpi({ icon, value, label, detail }: { icon: React.ReactNode; value: str
   );
 }
 
-function CareRegionRow({ region }: { region: string }) {
+function CareRegionRow({ region, facilitiesForRegion }: { region: string; facilitiesForRegion: Facility[] }) {
   return (
     <>
       <span className="region-label">{region}</span>
       {careNeeds.slice(0, 5).map((need) => {
-        const count = facilities.filter((facility) => facility.region === region && facility.services.includes(need)).length;
+        const count = facilitiesForRegion.filter((facility) => facility.region === region && facility.services.includes(need)).length;
         return (
           <span key={`${region}-${need}`} className={cn("care-dot", count > 0 && "care-dot-active")}>
             {count}

@@ -28,7 +28,7 @@ Required runtime variables:
 - `DATABRICKS_HOST`
 - `DATABRICKS_TOKEN`
 - `DATABRICKS_WAREHOUSE_ID` or `DATABRICKS_HTTP_PATH`
-- `PRISM_DATABRICKS_TABLE`, defaulting to `databricks_virtue_foundation_dataset_dais_2026.virtue_foundation_dataset.facilities`
+- `PRISM_DATABRICKS_TABLE`, defaulting to `workspace.default.facility_scored`
 
 For local development with Databricks CLI auth, set `PRISM_DATABRICKS_PROFILE` or `DATABRICKS_CONFIG_PROFILE` to an authenticated CLI profile instead of storing a token. The server will ask the CLI for auth material and the default warehouse at runtime.
 

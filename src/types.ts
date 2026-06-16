@@ -15,6 +15,7 @@ export interface UserProfile {
   name: string;
   dateOfBirth: string;
   location: string;
+  pincode: string;
   currentProblems: string;
   medicalHistory: string;
   insuranceNumber: string;
@@ -65,6 +66,16 @@ export interface Recommendation {
   facility: Facility;
   score: number;
   confidence: number;
+  claimScore?: number | null;
+  claimScoreBand?: string;
+  claimScoreBreakdown?: {
+    semanticCorroboration?: number | null;
+    evidenceDensity?: number | null;
+    consistency?: number | null;
+    digitalFootprint?: number | null;
+    doctorCapacityRatio?: number | null;
+    evidenceItems?: number | null;
+  };
   careNeed: CareNeed;
   matchExplanation: string;
   supportingEvidence: EvidenceItem[];
@@ -87,6 +98,21 @@ export interface JourneyPlan {
   hotel: HotelOption;
   instructions: string[];
   documents: string[];
+}
+
+export interface BookingAutomationRequest {
+  id: string;
+  facilityName: string;
+  facilityPhone: string;
+  bookingInstruction: string;
+  careNeed: CareNeed;
+  patientName: string;
+  patientLocation: string;
+  patientPincode: string;
+  preferredDate: string;
+  status: "needs_confirmation" | "ready_for_codex";
+  checklist: string[];
+  handoffPrompt: string;
 }
 
 export interface ChatMessage {

@@ -11,6 +11,11 @@ resources:
           sql_warehouse:
             id: c57ba8d2cc03799e
             permission: CAN_USE
+        - name: openai-api-key
+          secret:
+            scope: prism-concierge
+            key: openai-api-key
+            permission: READ
       config:
         command:
           - npm
@@ -22,7 +27,27 @@ resources:
           - name: DATABRICKS_WAREHOUSE_ID
             value_from: sql-warehouse
           - name: PRISM_DATABRICKS_TABLE
-            value: "databricks_virtue_foundation_dataset_dais_2026.virtue_foundation_dataset.facilities"
+            value: "workspace.default.facility_scored"
+          - name: OPENAI_API_KEY
+            value_from: openai-api-key
+          - name: OPENAI_REALTIME_MODEL
+            value: "gpt-realtime-2"
+          - name: OPENAI_REALTIME_VOICE
+            value: "marin"
+          - name: OPENAI_REALTIME_TRANSCRIPTION_MODEL
+            value: "gpt-4o-mini-transcribe"
+          - name: OPENAI_REALTIME_TRANSCRIPTION_LANGUAGE
+            value: "en"
+          - name: OPENAI_REALTIME_TRANSCRIPTION_PROMPT
+            value: "Expect concise healthcare concierge requests, hospital names, care needs, booking, transport, and location details."
+          - name: OPENAI_TTS_MODEL
+            value: "gpt-4o-mini-tts"
+          - name: OPENAI_TTS_VOICE
+            value: "marin"
+          - name: OPENAI_TTS_FORMAT
+            value: "mp3"
+          - name: OPENAI_TTS_INSTRUCTIONS
+            value: "Speak as a calm, warm health concierge. Sound natural, reassuring, and clear. Use gentle pacing and avoid a robotic cadence."
 
 targets:
   dev:

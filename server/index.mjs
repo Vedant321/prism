@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream, existsSync, readFileSync } from "node:fs";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -13,6 +13,10 @@ loadLocalEnv();
 const isProduction = process.env.NODE_ENV === "production";
 const port = Number(process.env.DATABRICKS_APP_PORT ?? process.env.PORT ?? 5173);
 const codexCommand = resolveCodexCommand();
+const queryLogPath =
+  process.env.PRISM_QUERY_LOG_PATH ??
+  path.join(process.env.HOME ?? root, ".codex/skills/databricks-delta-query/logs/query-debug.jsonl");
+const queryLogStreamClients = new Set();
 
 const vite = isProduction
   ? null
@@ -37,6 +41,18 @@ const server = http.createServer(async (req, res) => {
       });
 
       return sendJson(res, 200, result);
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/query-logs") {
+      const limit = clampNumber(Number(url.searchParams.get("limit") ?? 100), 1, 1000);
+      return sendJson(res, 200, {
+        entries: await readQueryLogEntries(limit),
+        logPath: queryLogPath,
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/query-log-stream") {
+      return streamQueryLogs(req, res, clampNumber(Number(url.searchParams.get("replay") ?? 5), 0, 25));
     }
 
     if (req.method === "POST" && url.pathname === "/api/codex-chat") {
@@ -97,8 +113,18 @@ server.listen(port, "0.0.0.0", () => {
 });
 
 async function fetchDatabricksNearest({ profile, careNeed, limit }) {
+  const configuredLimit = pickEnvPositiveInteger("DATABRICKS_QUERY_LIMIT", 20);
+  const rowLimit = clampNumber(limit, 1, Math.min(configuredLimit, 50));
   const config = await getDatabricksConfig();
   if (!config) {
+    await appendNearestFacilityQueryLog({
+      table: resolveDatabricksTable(),
+      profile,
+      careNeed,
+      limit: rowLimit,
+      mode: "config_missing",
+      status: "Databricks connection is not configured",
+    });
     return {
       ok: false,
       error:
@@ -107,7 +133,6 @@ async function fetchDatabricksNearest({ profile, careNeed, limit }) {
     };
   }
 
-  const rowLimit = clampNumber(limit, 1, 20);
   let rows = [];
   try {
     rows = await queryDatabricksRows(config, rowLimit, profile, careNeed);
@@ -126,7 +151,7 @@ async function fetchDatabricksNearest({ profile, careNeed, limit }) {
     .sort((a, b) => {
       const aCareMatch = a.facility.services.includes(a.careNeed) ? 0 : 1;
       const bCareMatch = b.facility.services.includes(b.careNeed) ? 0 : 1;
-      return aCareMatch - bCareMatch || a.facility.distanceKm - b.facility.distanceKm;
+      return aCareMatch - bCareMatch || b.score - a.score || a.facility.distanceKm - b.facility.distanceKm;
     })
     .slice(0, rowLimit);
 
@@ -151,9 +176,7 @@ async function getDatabricksConfig() {
   const token = process.env.DATABRICKS_TOKEN;
   const warehouseId =
     process.env.DATABRICKS_WAREHOUSE_ID ?? warehouseIdFromHttpPath(process.env.DATABRICKS_HTTP_PATH ?? "");
-  const table =
-    process.env.PRISM_DATABRICKS_TABLE ??
-    "databricks_virtue_foundation_dataset_dais_2026.virtue_foundation_dataset.facilities";
+  const table = resolveDatabricksTable();
 
   if (host && token && warehouseId) return { host, token, warehouseId, table };
 
@@ -176,8 +199,256 @@ async function getDatabricksConfig() {
   };
 }
 
+function databricksTableFromEnv() {
+  const catalog = process.env.DATABRICKS_CATALOG;
+  const schema = process.env.DATABRICKS_SCHEMA;
+  const table = process.env.DATABRICKS_TABLE;
+  if (!catalog || !schema || !table) return null;
+  return `${catalog}.${schema}.${table}`;
+}
+
+function resolveDatabricksTable() {
+  return (
+    process.env.PRISM_DATABRICKS_TABLE ??
+    databricksTableFromEnv() ??
+    "workspace.default.facility_scored"
+  );
+}
+
 async function queryDatabricksRows(config, limit, profile, careNeed) {
   const statement = process.env.PRISM_DATABRICKS_NEAREST_SQL ?? buildNearestFacilitySql(config.table, profile, careNeed, limit);
+  await appendNearestFacilityQueryLog({
+    table: config.table,
+    profile,
+    careNeed,
+    limit,
+    mode: process.env.PRISM_DATABRICKS_NEAREST_SQL ? "custom_override" : "score_aware",
+  });
+  try {
+    return await runDatabricksSqlStatement(config, statement);
+  } catch (error) {
+    if (process.env.PRISM_DATABRICKS_NEAREST_SQL || !isMissingDerivedFacilityColumn(error)) throw error;
+
+    const legacyStatement = buildLegacyNearestFacilitySql(config.table, profile, careNeed, limit);
+    await appendNearestFacilityQueryLog({
+      table: config.table,
+      profile,
+      careNeed,
+      limit,
+      mode: "legacy_fallback",
+    });
+    return runDatabricksSqlStatement(config, legacyStatement);
+  }
+}
+
+async function appendNearestFacilityQueryLog({ table, profile, careNeed, limit, mode, status }) {
+  const queryLog = buildNearestFacilityQueryLog({
+    table,
+    profile,
+    careNeed,
+    limit,
+    mode,
+  });
+  await appendQueryLog({
+    label: queryLog.label,
+    query: queryLog.query,
+    parameters: {
+      ...queryLog.parameters,
+      ...(status ? { status } : {}),
+    },
+  });
+}
+
+function buildNearestFacilityQueryLog({ table, profile, careNeed, limit, mode }) {
+  const location = String(profile?.location ?? "");
+  const city = location.split(",")[0]?.trim() || "";
+  const state = location.split(",")[1]?.trim() || "";
+  const termsByNeed = careMatchTermsByNeed();
+  const normalizedCareNeed = normalizeCareNeed(careNeed);
+  const matchedTerms = termsByNeed[normalizedCareNeed] ?? termsByNeed["General medicine"];
+  const label =
+    mode === "legacy_fallback"
+      ? "databricks_nearest_legacy"
+      : mode === "config_missing"
+        ? "databricks_nearest_config_missing"
+        : "databricks_nearest";
+  const query =
+    mode === "config_missing"
+      ? `
+PLANNED DATABRICKS NEAREST QUERY
+FROM ${quoteSqlPath(table)}
+WHERE Databricks connection is not configured
+MATCH :matchedTerms
+ORDER BY location match for :city / :state, distance_km ASC
+LIMIT :limit
+`.trim()
+      : mode === "custom_override"
+      ? `
+CUSTOM SQL OVERRIDE
+FROM ${quoteSqlPath(table)}
+WHERE PRISM_DATABRICKS_NEAREST_SQL is configured
+ORDER BY custom statement
+LIMIT :limit
+`.trim()
+      : mode === "legacy_fallback"
+        ? `
+SELECT
+  name,
+  address_city,
+  address_stateOrRegion,
+  officialPhone_str,
+  distance_km
+FROM ${quoteSqlPath(table)}
+WHERE name IS NOT NULL
+  AND latitude IS NOT NULL
+  AND longitude IS NOT NULL
+  AND (${careClause})
+ORDER BY
+  clinical capability match for :matchedTerms,
+  location match for :city / :state,
+  distance_km ASC
+LIMIT :limit
+`.trim()
+        : `
+SELECT
+  name,
+  address_city,
+  address_stateOrRegion,
+  officialPhone_str,
+  claim_score,
+  claim_score_band,
+  distance_km
+FROM ${quoteSqlPath(table)}
+WHERE name IS NOT NULL
+  AND latitude IS NOT NULL
+  AND longitude IS NOT NULL
+  AND care capability matches :matchedTerms
+ORDER BY
+  exact care match,
+  location match for :city / :state,
+  claim_score_band,
+  claim_score DESC,
+  distance_km ASC
+LIMIT :limit
+`.trim();
+
+  return {
+    label,
+    query,
+    parameters: {
+      mode,
+      table,
+      careNeed: normalizedCareNeed,
+      matchedTerms,
+      location,
+      city,
+      state,
+      pincode: profile?.pincode ?? "",
+      limit,
+    },
+  };
+}
+
+async function appendQueryLog({ label, query, parameters }) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    label,
+    query: compactSql(query),
+    parameters: scrubQueryParameters(parameters),
+  };
+  await mkdir(path.dirname(queryLogPath), { recursive: true });
+  await appendFile(queryLogPath, `${JSON.stringify(entry)}\n`, "utf8");
+  broadcastQueryLogEntry(entry);
+  return entry;
+}
+
+function compactSql(query) {
+  return String(query ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function scrubQueryParameters(parameters) {
+  return Object.fromEntries(
+    Object.entries(parameters ?? {}).map(([key, value]) => {
+      const lowered = key.toLowerCase();
+      if (/(token|secret|password|host|http|client)/.test(lowered)) return [key, "[redacted]"];
+      return [key, value];
+    }),
+  );
+}
+
+async function readQueryLogEntries(limit) {
+  if (limit <= 0) return [];
+  if (!existsSync(queryLogPath)) return [];
+  const text = await readFile(queryLogPath, "utf8").catch(() => "");
+  return text
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .slice(-limit)
+    .reverse()
+    .map(parseQueryLogLine);
+}
+
+function parseQueryLogLine(line) {
+  try {
+    return JSON.parse(line);
+  } catch {
+    return {
+      timestamp: "",
+      label: "parse_error",
+      query: line,
+      parameters: {},
+    };
+  }
+}
+
+async function streamQueryLogs(req, res, replay) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
+  });
+  res.flushHeaders?.();
+
+  for (const entry of (await readQueryLogEntries(replay)).reverse()) {
+    writeQueryLogStreamEvent(res, entry);
+  }
+  res.write("event: ready\ndata: {}\n\n");
+
+  const client = { res };
+  queryLogStreamClients.add(client);
+  const timer = setInterval(() => {
+    try {
+      res.write(": ping\n\n");
+    } catch {
+      clearInterval(timer);
+      queryLogStreamClients.delete(client);
+    }
+  }, 15000);
+
+  req.on("close", () => {
+    clearInterval(timer);
+    queryLogStreamClients.delete(client);
+  });
+}
+
+function broadcastQueryLogEntry(entry) {
+  for (const client of queryLogStreamClients) {
+    try {
+      writeQueryLogStreamEvent(client.res, entry);
+    } catch {
+      queryLogStreamClients.delete(client);
+    }
+  }
+}
+
+function writeQueryLogStreamEvent(res, entry) {
+  res.write(`event: entry\ndata: ${JSON.stringify(entry)}\n\n`);
+}
+
+async function runDatabricksSqlStatement(config, statement) {
   const response = await fetch(`${config.host}/api/2.0/sql/statements/`, {
     method: "POST",
     headers: {
@@ -214,6 +485,7 @@ function buildNearestFacilitySql(table, profile, careNeed, limit) {
   const state = location.split(",")[1]?.trim() || "";
   const coordinates = knownCoordinates(location);
   const careClause = buildCareMatchClause(careNeed);
+  const locationOrderSql = buildScoredLocationOrderSql(city, state);
   const distanceExpression = coordinates
     ? `6371 * 2 * ASIN(SQRT(POWER(SIN(RADIANS(latitude - ${coordinates.lat}) / 2), 2) + COS(RADIANS(${coordinates.lat})) * COS(RADIANS(latitude)) * POWER(SIN(RADIANS(longitude - ${coordinates.lon}) / 2), 2)))`
     : "999";
@@ -226,17 +498,98 @@ FROM ${quoteSqlPath(table)}
 WHERE name IS NOT NULL
   AND latitude IS NOT NULL
   AND longitude IS NOT NULL
-  AND lower(coalesce(organization_type, 'facility')) LIKE '%facility%'
+  AND (${careClause})
 ORDER BY
   CASE WHEN ${careClause} THEN 0 ELSE 1 END,
-  CASE
-    WHEN ${city ? `lower(coalesce(address_city, '')) = lower('${escapeSqlLiteral(city)}')` : "false"} THEN 0
-    WHEN ${state ? `lower(coalesce(address_stateOrRegion, '')) LIKE lower('%${escapeSqlLiteral(state)}%')` : "false"} THEN 1
-    ELSE 2
-  END,
+  ${locationOrderSql},
+  ${buildFacilityTypeOrderSql()},
+  CASE WHEN claim_score_band IN ('High', 'Medium') THEN 0 ELSE 1 END,
+  try_cast(claim_score AS DOUBLE) DESC NULLS LAST,
   distance_km ASC
 LIMIT ${limit}
 `.trim();
+}
+
+function buildLegacyNearestFacilitySql(table, profile, careNeed, limit) {
+  const location = String(profile?.location ?? "");
+  const city = location.split(",")[0]?.trim() || "";
+  const state = location.split(",")[1]?.trim() || "";
+  const coordinates = knownCoordinates(location);
+  const careClause = buildLegacyCareMatchClause(careNeed);
+  const locationOrderSql = buildLegacyLocationOrderSql(city, state);
+  const distanceExpression = coordinates
+    ? `6371 * 2 * ASIN(SQRT(POWER(SIN(RADIANS(latitude - ${coordinates.lat}) / 2), 2) + COS(RADIANS(${coordinates.lat})) * COS(RADIANS(latitude)) * POWER(SIN(RADIANS(longitude - ${coordinates.lon}) / 2), 2)))`
+    : "999";
+
+  return `
+SELECT
+  *,
+  ${distanceExpression} AS distance_km
+FROM ${quoteSqlPath(table)}
+WHERE name IS NOT NULL
+  AND latitude IS NOT NULL
+  AND longitude IS NOT NULL
+  AND (${careClause})
+ORDER BY
+  CASE WHEN ${careClause} THEN 0 ELSE 1 END,
+  ${locationOrderSql},
+  ${buildFacilityTypeOrderSql()},
+  distance_km ASC
+LIMIT ${limit}
+`.trim();
+}
+
+function buildScoredLocationOrderSql(city, state) {
+  const cityCondition = buildScoredCityCondition(city);
+  const stateCondition = state ? `state_norm LIKE lower('%${escapeSqlLiteral(state)}%')` : "false";
+  return `CASE
+    WHEN ${cityCondition} THEN 0
+    WHEN ${stateCondition} THEN 1
+    ELSE 2
+  END`;
+}
+
+function buildLegacyLocationOrderSql(city, state) {
+  const cityCondition = buildLegacyCityCondition(city);
+  const stateCondition = state ? `lower(coalesce(address_stateOrRegion, '')) LIKE lower('%${escapeSqlLiteral(state)}%')` : "false";
+  return `CASE
+    WHEN ${cityCondition} THEN 0
+    WHEN ${stateCondition} THEN 1
+    ELSE 2
+  END`;
+}
+
+function buildScoredCityCondition(city) {
+  const normalizedCity = city.trim().toLowerCase();
+  if (!normalizedCity) return "false";
+  if (normalizedCity === "delhi" || normalizedCity === "new delhi") {
+    return "city_norm IN ('delhi', 'new delhi') OR state_norm = 'delhi'";
+  }
+  return `city_norm = lower('${escapeSqlLiteral(city)}')`;
+}
+
+function buildLegacyCityCondition(city) {
+  const normalizedCity = city.trim().toLowerCase();
+  if (!normalizedCity) return "false";
+  if (normalizedCity === "delhi" || normalizedCity === "new delhi") {
+    return "lower(coalesce(address_city, '')) IN ('delhi', 'new delhi') OR lower(coalesce(address_stateOrRegion, '')) = 'delhi'";
+  }
+  return `lower(coalesce(address_city, '')) = lower('${escapeSqlLiteral(city)}')`;
+}
+
+function buildFacilityTypeOrderSql() {
+  return `CASE
+    WHEN lower(coalesce(organization_type, '')) LIKE '%hospital%'
+      OR lower(coalesce(name, '')) LIKE '%hospital%'
+      OR lower(coalesce(name, '')) LIKE '%institute%'
+      OR lower(coalesce(name, '')) LIKE '%medical centre%'
+      OR lower(coalesce(name, '')) LIKE '%medical center%' THEN 0
+    WHEN lower(coalesce(name, '')) LIKE '%lab%'
+      OR lower(coalesce(name, '')) LIKE '%diagnostic%'
+      OR lower(coalesce(name, '')) LIKE '%imaging%'
+      OR lower(coalesce(name, '')) LIKE '%path%' THEN 2
+    ELSE 1
+  END`;
 }
 
 async function waitForDatabricksStatement(config, statement) {
@@ -277,7 +630,16 @@ function databricksRowToRecommendation(row, profile, careNeed, source) {
   const selectedCareNeed = normalizeCareNeed(
     pickValue(row, ["care_need", "service", "primary_service", "specialty", "service_line"]) ?? careNeed,
   );
-  const services = parseServices(pickValue(row, ["services", "service_lines", "specialties", "capability"]), selectedCareNeed);
+  const clinicalEvidenceItems = [
+    pickValue(row, ["services", "service_lines", "specialties_clean", "specialties", "specialty"]),
+    pickValue(row, ["procedure_clean", "procedure"]),
+    pickValue(row, ["equipment_clean", "equipment"]),
+    pickValue(row, ["capability_clean", "capability"]),
+  ].flatMap(parseList);
+  const services = parseServices(
+    clinicalEvidenceItems.length ? clinicalEvidenceItems : pickValue(row, ["services", "service_lines", "specialties", "capability"]),
+    selectedCareNeed,
+  );
   const waitMinutes = pickPositiveNumber(row, ["wait_minutes", "waitMinutes", "estimated_wait_minutes"], 45);
   const cabMinutes = pickPositiveNumber(
     row,
@@ -289,6 +651,16 @@ function databricksRowToRecommendation(row, profile, careNeed, source) {
     0,
     99,
   );
+  const claimScore = pickOptionalNumber(row, ["claim_score"]);
+  const claimScoreBand = pickValue(row, ["claim_score_band"]);
+  const scoreSemanticCorroboration = pickOptionalNumber(row, ["score_semantic_corroboration"]);
+  const scoreEvidenceDensity = pickOptionalNumber(row, ["score_evidence_density"]);
+  const scoreConsistency = pickOptionalNumber(row, ["score_consistency"]);
+  const scoreDigitalFootprint = pickOptionalNumber(row, ["score_digital_footprint"]);
+  const doctorCapacityRatio = pickOptionalNumber(row, ["doctor_capacity_ratio"]);
+  const evidenceItemCount = pickOptionalNumber(row, ["n_evidence_items"]);
+  const credibilityScore = clampNumber(Math.round(claimScore ?? evidenceConfidence), 0, 99);
+  const hasUsableClaimScore = claimScore !== null && claimScore > 0;
   const averageVisitCost = pickNumber(row, ["average_visit_cost", "avg_visit_cost", "typical_visit_cost", "price"], 0);
   const priceIndex = clampNumber(Math.round(pickNumber(row, ["price_index", "priceIndex", "budget_tier"], 2)), 1, 4);
   const facility = {
@@ -305,7 +677,7 @@ function databricksRowToRecommendation(row, profile, careNeed, source) {
     priceIndex,
     averageVisitCost,
     waitMinutes,
-    evidenceConfidence,
+    evidenceConfidence: credibilityScore,
     availability: pickValue(row, ["availability", "availability_status", "status"]) ?? "Availability must be confirmed by phone",
     phone: firstListItem(pickValue(row, ["phone", "phone_number", "contact_phone", "officialPhone", "phone_numbers"])) ?? "Phone not listed",
     booking: pickValue(row, ["booking", "booking_instructions", "appointment_instructions"]) ?? "Call before travel",
@@ -314,10 +686,23 @@ function databricksRowToRecommendation(row, profile, careNeed, source) {
         label: pickValue(row, ["evidence_label"]) ?? "Facility row returned from Databricks",
         source,
         freshness: pickValue(row, ["freshness", "updated_at", "snapshot_date", "recency_of_page_update"]) ?? "Databricks query",
-        confidence: evidenceConfidence,
+        confidence: credibilityScore,
       },
+      ...(claimScore !== null
+        ? [
+            {
+              label: `Databricks claim validity score (${claimScoreBand ?? "unbanded"})`,
+              source: "facility_claim_score.py",
+              freshness: pickValue(row, ["freshness", "updated_at", "snapshot_date", "recency_of_page_update"]) ?? "Databricks scoring columns",
+              confidence: credibilityScore,
+            },
+          ]
+        : []),
     ],
-    missingEvidence: parseList(pickValue(row, ["missing_evidence", "missing_fields"])),
+    missingEvidence: [
+      ...parseList(pickValue(row, ["missing_evidence", "missing_fields"])),
+      ...(!hasUsableClaimScore ? ["Databricks claim_score is not present or not usable for this row"] : []),
+    ],
     suspiciousSignals: parseList(pickValue(row, ["suspicious_signals", "conflicts"])),
     travelTimes: {
       Ambulance: pickPositiveNumber(row, ["ambulance_minutes"], Math.max(8, Math.round(cabMinutes * 0.7))),
@@ -335,11 +720,25 @@ function databricksRowToRecommendation(row, profile, careNeed, source) {
     ],
   };
 
-  const score = clampNumber(Math.round(100 - distanceKm * 2 + evidenceConfidence / 5), 0, 100);
+  const careMatchDriver = services.includes(selectedCareNeed) ? 32 : 12;
+  const distanceDriver = Math.max(0, Math.round(20 - distanceKm));
+  const claimDriver = Math.round(credibilityScore / 2);
+  const travelDriver = Math.max(0, 10 - Math.round(cabMinutes / 8));
+  const score = clampNumber(Math.round(careMatchDriver + distanceDriver + Math.round(credibilityScore * 0.4) + travelDriver), 0, 100);
   return {
     facility,
     score,
-    confidence: evidenceConfidence,
+    confidence: credibilityScore,
+    claimScore,
+    claimScoreBand: claimScoreBand ?? undefined,
+    claimScoreBreakdown: {
+      semanticCorroboration: scoreSemanticCorroboration,
+      evidenceDensity: scoreEvidenceDensity,
+      consistency: scoreConsistency,
+      digitalFootprint: scoreDigitalFootprint,
+      doctorCapacityRatio,
+      evidenceItems: evidenceItemCount,
+    },
     careNeed: selectedCareNeed,
     matchExplanation: `${name} was returned from Databricks and is ${distanceKm.toFixed(1)} km from ${
       profile?.location ?? "the selected location"
@@ -350,10 +749,10 @@ function databricksRowToRecommendation(row, profile, careNeed, source) {
     estimatedTravelTime: facility.travelTimes.Cab,
     pricingSignal: averageVisitCost ? `${formatCurrencyINR(averageVisitCost)} typical first-visit estimate` : "Price not listed",
     rankDrivers: [
-      { label: "Distance", value: Math.max(0, Math.round(40 - distanceKm)), detail: `${distanceKm.toFixed(1)} km away.` },
-      { label: "Evidence", value: Math.round(evidenceConfidence / 2), detail: `${evidenceConfidence}% source confidence.` },
-      { label: "Care match", value: services.includes(selectedCareNeed) ? 42 : 16, detail: `${selectedCareNeed} from Databricks row.` },
-      { label: "Travel", value: Math.max(0, 25 - Math.round(cabMinutes / 3)), detail: `${cabMinutes} minutes by cab.` },
+      { label: "Care match", value: careMatchDriver, detail: `${selectedCareNeed} from Databricks capability fields.` },
+      { label: "Claim score", value: claimDriver, detail: claimScore !== null ? `${claimScore.toFixed(0)} claim validity (${claimScoreBand ?? "unbanded"}).` : `${credibilityScore}% fallback evidence confidence.` },
+      { label: "Distance", value: distanceDriver, detail: `${distanceKm.toFixed(1)} km away.` },
+      { label: "Travel", value: travelDriver, detail: `${cabMinutes} minutes by cab.` },
     ],
   };
 }
@@ -472,6 +871,9 @@ async function createOpenAIRealtimeClientSecret({ profile, recommendations }) {
     booking: item?.facility?.booking,
     score: item?.score,
     confidence: item?.confidence,
+    claimScore: item?.claimScore,
+    claimScoreBand: item?.claimScoreBand,
+    claimScoreBreakdown: item?.claimScoreBreakdown,
     careNeed: item?.careNeed,
     distanceKm: item?.facility?.distanceKm,
     estimatedTravelTime: item?.estimatedTravelTime,
@@ -492,12 +894,21 @@ async function createOpenAIRealtimeClientSecret({ profile, recommendations }) {
         instructions: buildRealtimeInstructions({ profile: safeProfile, recommendations: topRecommendations }),
         audio: {
           input: {
+            noise_reduction: {
+              type: process.env.OPENAI_REALTIME_NOISE_REDUCTION ?? "near_field",
+            },
+            turn_detection: {
+              type: "server_vad",
+              threshold: pickEnvNumber("OPENAI_REALTIME_VAD_THRESHOLD", 0.72),
+              prefix_padding_ms: pickEnvPositiveInteger("OPENAI_REALTIME_VAD_PREFIX_PADDING_MS", 250),
+              silence_duration_ms: pickEnvPositiveInteger("OPENAI_REALTIME_VAD_SILENCE_DURATION_MS", 900),
+              create_response: false,
+              interrupt_response: false,
+            },
             transcription: {
               model: process.env.OPENAI_REALTIME_TRANSCRIPTION_MODEL ?? "gpt-4o-mini-transcribe",
               language: process.env.OPENAI_REALTIME_TRANSCRIPTION_LANGUAGE ?? "en",
-              prompt:
-                process.env.OPENAI_REALTIME_TRANSCRIPTION_PROMPT ??
-                "Expect concise healthcare concierge requests, hospital names, care needs, booking, transport, and location details.",
+              ...optionalRealtimeTranscriptionPrompt(),
             },
           },
           output: {
@@ -524,6 +935,11 @@ async function createOpenAIRealtimeClientSecret({ profile, recommendations }) {
   };
 }
 
+function optionalRealtimeTranscriptionPrompt() {
+  const prompt = process.env.OPENAI_REALTIME_TRANSCRIPTION_PROMPT?.trim();
+  return prompt ? { prompt } : {};
+}
+
 function buildRealtimeInstructions({ profile, recommendations }) {
   return `You are Prism, a calm health concierge voice assistant.
 
@@ -540,7 +956,8 @@ Every logistics step is optional and skippable. End each turn with one clear nex
 
 Do not diagnose, prescribe, or replace emergency care. If symptoms sound urgent, advise immediate local emergency care.
 
-Do not mention internal implementation details. Do not claim live Databricks results unless the user has recommendations in context.
+Do not mention internal implementation details, backend systems, vendor names, tools, model providers, SQL, or query logs.
+If you need to refer to source quality, say "available facility data", "Prism facility data", or "capability evidence" instead.
 
 Profile context:
 ${JSON.stringify(profile, null, 2)}
@@ -554,6 +971,7 @@ function stableSafetyIdentifier(profile) {
   const source = JSON.stringify({
     role: profile?.role,
     location: profile?.location,
+    pincode: profile?.pincode,
     name: profile?.name,
   });
   return createHash("sha256").update(source || "prism-demo-user").digest("hex");
@@ -604,6 +1022,7 @@ Important behavior:
 - When equipment is not directly listed, say that equipment is not directly listed and use the available services/capability evidence instead.
 - If a field is missing or uncertain, ask a concise follow-up or clearly mark it as needing confirmation.
 - Do not mention internal implementation details, tools, command names, traces, prompts, or backend execution.
+- For booking requests, prepare the booking details and confirmation checklist. Do not claim an appointment is booked unless the user has explicitly confirmed the final submission/call/message and a booking reference or appointment time is available.
 - The structured recommendation UI is handled separately by the app, so focus on the chat response.
 - If the user asks for the nearest, closest, or nearby center and recommendations are provided, answer with the closest capability match, distance, and evidence caveat. Do not include booking, transport, and hotel unless the user asks.
 
@@ -664,6 +1083,7 @@ function redactProfile(profile) {
     name: profile.name,
     dateOfBirth: profile.dateOfBirth,
     location: profile.location,
+    pincode: profile.pincode,
     currentProblems: profile.currentProblems,
     medicalHistory: profile.medicalHistory,
     budgetType: profile.budgetType,
@@ -741,8 +1161,14 @@ function resolveCodexCommand() {
 }
 
 function loadLocalEnv() {
-  for (const envFile of [".env", ".env.local"]) {
-    const envPath = path.join(root, envFile);
+  const envFiles = [
+    path.join(root, ".env"),
+    path.join(root, ".env.local"),
+    process.env.PRISM_DATABRICKS_ENV_FILE,
+    path.join(process.env.HOME ?? "", "Downloads/databricks-delta-query.env"),
+  ].filter(Boolean);
+
+  for (const envPath of envFiles) {
     if (!existsSync(envPath)) continue;
 
     const lines = readFileSync(envPath, "utf8").split(/\r?\n/);
@@ -754,7 +1180,7 @@ function loadLocalEnv() {
 
       const [, key, rawValue] = match;
       if (process.env[key] !== undefined) continue;
-      process.env[key] = rawValue.replace(/^(['"])(.*)\1$/, "$2");
+      process.env[key] = rawValue.trim().replace(/^(['"])(.*)\1$/, "$2");
     }
   }
 }
@@ -871,7 +1297,8 @@ function contentType(filePath) {
 
 function normalizeHost(host) {
   if (!host) return "";
-  return host.startsWith("http") ? host.replace(/\/$/, "") : `https://${host.replace(/\/$/, "")}`;
+  const trimmed = String(host).trim();
+  return trimmed.startsWith("http") ? trimmed.replace(/\/$/, "") : `https://${trimmed.replace(/\/$/, "")}`;
 }
 
 function warehouseIdFromHttpPath(httpPath) {
@@ -890,17 +1317,35 @@ function escapeSqlLiteral(value) {
 }
 
 function buildCareMatchClause(careNeed) {
+  const haystack =
+    "lower(concat_ws(' ', coalesce(name, ''), coalesce(search_text, ''), coalesce(specialties, ''), coalesce(procedure, ''), coalesce(equipment, ''), coalesce(capability, ''), coalesce(description, '')))";
+  const termsByNeed = careMatchTermsByNeed();
+  const terms = termsByNeed[normalizeCareNeed(careNeed)] ?? termsByNeed["General medicine"];
+  return terms.map((term) => `${haystack} LIKE '%${escapeSqlLiteral(term)}%'`).join(" OR ");
+}
+
+function buildLegacyCareMatchClause(careNeed) {
   const haystack = "lower(concat_ws(' ', coalesce(name, ''), coalesce(specialties, ''), coalesce(capability, ''), coalesce(description, '')))";
+  const termsByNeed = careMatchTermsByNeed();
+  const terms = termsByNeed[normalizeCareNeed(careNeed)] ?? termsByNeed["General medicine"];
+  return terms.map((term) => `${haystack} LIKE '%${escapeSqlLiteral(term)}%'`).join(" OR ");
+}
+
+function careMatchTermsByNeed() {
   const termsByNeed = {
     Dialysis: ["dialysis", "nephrology", "renal", "kidney"],
     Trauma: ["trauma", "emergency", "critical care", "icu"],
-    Cardiology: ["cardiology", "cardiac", "heart"],
+    Cardiology: ["cardiology", "cardiac", "heart", "heart surgery", "cardiac surgery", "bypass", "angioplasty"],
     Maternity: ["maternity", "maternal", "gynecology", "obstetric", "pediatric"],
     Oncology: ["oncology", "cancer", "radiation oncology"],
     "General medicine": ["general medicine", "internal medicine", "hospital"],
   };
-  const terms = termsByNeed[normalizeCareNeed(careNeed)] ?? termsByNeed["General medicine"];
-  return terms.map((term) => `${haystack} LIKE '%${escapeSqlLiteral(term)}%'`).join(" OR ");
+  return termsByNeed;
+}
+
+function isMissingDerivedFacilityColumn(error) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /UNRESOLVED_COLUMN|cannot resolve|column.*not.*found|search_text|city_norm|state_norm|claim_score/i.test(message);
 }
 
 function knownCoordinates(location) {
@@ -947,6 +1392,22 @@ function pickNumber(row, names, fallback) {
   return Number.isFinite(number) ? number : fallback;
 }
 
+function pickOptionalNumber(row, names) {
+  const value = pickValue(row, names);
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function pickEnvPositiveInteger(name, fallback) {
+  const number = Number(process.env[name]);
+  return Number.isInteger(number) && number > 0 ? number : fallback;
+}
+
+function pickEnvNumber(name, fallback) {
+  const number = Number(process.env[name]);
+  return Number.isFinite(number) ? number : fallback;
+}
+
 function pickPositiveNumber(row, names, fallback) {
   const number = pickNumber(row, names, fallback);
   return Number.isFinite(number) && number > 0 ? number : fallback;
@@ -990,7 +1451,14 @@ function normalizeCareNeed(value) {
     return "Dialysis";
   }
   if (normalized.includes("trauma") || normalized.includes("emergency")) return "Trauma";
-  if (normalized.includes("cardio") || normalized.includes("heart")) return "Cardiology";
+  if (
+    normalized.includes("cardio") ||
+    normalized.includes("heart") ||
+    normalized.includes("bypass") ||
+    normalized.includes("angioplasty")
+  ) {
+    return "Cardiology";
+  }
   if (normalized.includes("maternity") || normalized.includes("preg") || normalized.includes("obstetric")) return "Maternity";
   if (normalized.includes("oncology") || normalized.includes("cancer")) return "Oncology";
   return "General medicine";

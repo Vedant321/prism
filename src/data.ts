@@ -4,6 +4,7 @@ export const defaultProfile: UserProfile = {
   name: "Ananya Sharma",
   dateOfBirth: "1984-04-18",
   location: "Jaipur, Rajasthan",
+  pincode: "302001",
   currentProblems: "Stage 4 CKD; intermittent fatigue",
   medicalHistory: "Hypertension, diabetes, no known drug allergies",
   insuranceNumber: "INS-DEMO-2049",

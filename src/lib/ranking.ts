@@ -13,7 +13,7 @@ import { clamp, formatCurrency } from "./utils";
 const careLexicon: Record<CareNeed, string[]> = {
   Dialysis: ["dialysis", "kidney", "renal", "ckd", "nephrology", "creatinine"],
   Trauma: ["trauma", "accident", "injury", "fracture", "bleeding", "emergency", "head injury"],
-  Cardiology: ["heart", "chest pain", "cardiac", "cardiology", "ecg", "breathless"],
+  Cardiology: ["heart", "heart surgery", "cardiac surgery", "bypass", "angioplasty", "chest pain", "cardiac", "cardiology", "ecg", "breathless"],
   Maternity: ["pregnancy", "maternity", "labor", "antenatal", "delivery", "obstetric"],
   Oncology: ["cancer", "oncology", "chemo", "radiation", "tumor", "biopsy"],
   "General medicine": ["fever", "infection", "medicine", "general", "weakness", "pain"],
@@ -209,7 +209,10 @@ export function answerPrompt(
 
   const detected = detectCareNeedForTurn(prompt, profile);
   const missing = getMissingInputs(prompt, profile);
-  const wantsNearest = /nearest|nearby|near me|closest|near|center|centre|hospital|clinic/i.test(prompt);
+  const wantsNearest =
+    /nearest|nearby|near me|closest|near|find|want|need|treatment|surgery|operation|procedure|surgeon|specialist|center|centre|hospital|clinic/i.test(
+      prompt,
+    );
   const wantsTrip = /trip|transport|hotel|book|plan|route|cab|ambulance|train/i.test(prompt);
   const wantsCheapest = /cheap|cheapest|economy|low cost|budget/i.test(prompt);
   const wantsWhy = /why|rank|evidence|confidence|explain/i.test(prompt);
