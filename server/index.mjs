@@ -142,6 +142,9 @@ async function getDatabricksConfig() {
 
   if (host && token && warehouseId) return { host, token, warehouseId, table };
 
+  const appToken = await getDatabricksAppToken(host);
+  if (host && appToken && warehouseId) return { host, token: appToken, warehouseId, table };
+
   const profile = process.env.PRISM_DATABRICKS_PROFILE ?? process.env.DATABRICKS_CONFIG_PROFILE;
   if (!profile) return null;
 
@@ -628,6 +631,30 @@ async function getDatabricksCliAuth(profile) {
     host: normalizeHost(env.host ?? env.DATABRICKS_HOST),
     token: token.access_token ?? token.token_value ?? env.token ?? env.DATABRICKS_TOKEN,
   };
+}
+
+async function getDatabricksAppToken(host) {
+  const clientId = process.env.DATABRICKS_CLIENT_ID;
+  const clientSecret = process.env.DATABRICKS_CLIENT_SECRET;
+  if (!host || !clientId || !clientSecret) return "";
+
+  const body = new URLSearchParams({
+    grant_type: "client_credentials",
+    scope: "all-apis",
+  });
+  const response = await fetch(`${host}/oidc/v1/token`, {
+    method: "POST",
+    headers: {
+      authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`,
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body,
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.error_description ?? data?.error ?? "Databricks app OAuth token request failed.");
+  }
+  return data.access_token ?? "";
 }
 
 async function getDatabricksDefaultWarehouse(profile) {

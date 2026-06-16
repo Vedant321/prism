@@ -30,6 +30,7 @@ import {
 import { analyticsSnapshot, careNeeds, defaultProfile, facilities } from "./data";
 import { AnimatedVideoOnScroll } from "./components/blocks/animated-video-on-scroll";
 import { PromptInputBox } from "./components/ui/ai-prompt-box";
+import { OpenAIVoiceChat } from "./components/ui/openai-voice-chat";
 import { TextHoverEffect } from "./components/ui/hover-text-effect";
 import { GlowCard } from "./components/ui/spotlight-card";
 import { WebGLShader } from "./components/ui/web-gl-shader";
@@ -468,7 +469,6 @@ function Landing({ onEnter }: { onEnter: () => void }) {
             </div>
             <span>Prism</span>
           </div>
-          <span className="hero-data-source">Private health concierge</span>
         </nav>
         <div className="hero-inner">
           <div className="hero-content">
@@ -861,10 +861,13 @@ function ChatTab({
             <p className="eyebrow">Concierge</p>
             <h2>{profile.role === "patient" ? "Step-by-step care guidance" : "Referral evidence workspace"}</h2>
           </div>
-          <button type="button" className={cn("icon-text-button", speaking && "selected-soft")} onClick={() => setSpeaking(!speaking)}>
-            <Volume2 size={16} />
-            Speak replies
-          </button>
+          <div className="chat-heading-actions">
+            <OpenAIVoiceChat profile={profile} recommendations={recommendations} />
+            <button type="button" className={cn("icon-text-button", speaking && "selected-soft")} onClick={() => setSpeaking(!speaking)}>
+              <Volume2 size={16} />
+              Speak replies
+            </button>
+          </div>
         </div>
 
         <div className="message-list" aria-live="polite">
